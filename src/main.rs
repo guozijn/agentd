@@ -1,10 +1,7 @@
-mod coordinator;
-mod db;
-mod ipc;
-
+use agentd::coordinator::Coordinator;
+use agentd::db::Database;
+use agentd::ipc;
 use anyhow::{Context, Result};
-use coordinator::Coordinator;
-use db::Database;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

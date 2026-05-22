@@ -18,6 +18,7 @@ The daemon is model-agnostic. Agents communicate over a Unix Domain Socket using
 - Runtime IPC discovery through `DescribeInterface`
 - Health checks through `Health`
 - Structured runtime and database metrics through `Metrics`
+- Daemon-level IPC integration tests for worker coordination and protocol limits
 - Python smoke clients, including a real DeepSeek-backed multi-agent loop
 
 ## Storage
@@ -181,5 +182,4 @@ The MVP is intentionally small. The next production-hardening slices are:
 - Multi-version migration coverage as the schema evolves beyond v1
 - Lease owner IDs in richer diagnostics
 - Backpressure beyond the current bounded 1 MiB request lines
-- Integration tests that launch the daemon and exercise concurrent workers
 - Optional Prometheus text export or systemd watchdog integration
