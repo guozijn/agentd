@@ -23,10 +23,16 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: macos-latest
-            target: x86_64-apple-darwin
+            archive_name: agentd-linux-x86_64
+            apt_packages: ""
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            archive_name: agentd-linux-aarch64
+            apt_packages: gcc-aarch64-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
+            archive_name: agentd-macos-aarch64
+            apt_packages: ""
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -42,29 +48,39 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Install Linux cross linker
+        if: matrix.apt_packages != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt_packages }}
+
       - name: Test
         run: cargo test --locked
 
       - name: Build
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package binary
         shell: bash
         run: |
           set -euo pipefail
-          archive="agentd-${{ matrix.target }}.tar.gz"
-          staging="dist/agentd-${{ matrix.target }}"
+          archive="${{ matrix.archive_name }}.tar.gz"
+          staging="dist/${{ matrix.archive_name }}"
           mkdir -p "$staging"
           cp "target/${{ matrix.target }}/release/agentd" "$staging/"
           cp README.md LICENSE .env.example client_test.py "$staging/"
           cp scripts/deepseek_agent_loop.py "$staging/"
-          tar -czf "dist/$archive" -C dist "agentd-${{ matrix.target }}"
+          tar -czf "dist/$archive" -C dist "${{ matrix.archive_name }}"
           shasum -a 256 "dist/$archive" > "dist/$archive.sha256"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: agentd-${{ matrix.target }}
+          name: ${{ matrix.archive_name }}
           path: |
             dist/*.tar.gz
             dist/*.sha256

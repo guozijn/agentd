@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>agentd | Local-first state machine daemon for AI agents</title>
+    <meta
+      name="description"
+      content="agentd is a local-first state machine daemon that persists AI agent task state, DAG transitions, leases, and event journals over Unix Domain Socket JSON Lines IPC."
+    >
+    <link rel="canonical" href="https://agentd.cc/">
+    <link rel="icon" href="favicon.png" type="image/png">
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="site-header" aria-label="Primary">
+      <a class="brand" href="/">agentd.cc</a>
+      <nav aria-label="Sections">
+        <a href="#runtime">Runtime</a>
+        <a href="#interface">Interface</a>
+        <a href="https://github.com/guozijn/agentd">GitHub</a>
+      </nav>
+    </header>
+
+    <section class="hero">
+      <div class="hero-inner">
+        <p class="eyebrow">Local-first infrastructure for agent state</p>
+        <h1>agentd</h1>
+        <p class="lede">
+          An out-of-process state machine daemon for AI agents. It owns durable task state,
+          strict DAG transitions, leases, heartbeats, and an append-only event journal.
+        </p>
+        <div class="hero-actions">
+          <a class="button" href="https://github.com/guozijn/agentd">View source</a>
+          <a class="button secondary" href="#interface">Runtime interface</a>
+        </div>
+      </div>
+    </section>
+
+    <main>
+      <section id="runtime">
+        <div class="section-inner">
+          <p class="section-kicker">What it does</p>
+          <h2>One local source of truth for long-running agent work.</h2>
+          <div class="feature-grid">
+            <article class="feature">
+              <div class="feature-mark"></div>
+              <h3>Durable state</h3>
+              <p>SQLite stores global tasks, DAG nodes, result payloads, and event history under <code>~/.agentd</code>.</p>
+            </article>
+            <article class="feature">
+              <div class="feature-mark"></div>
+              <h3>Strict transitions</h3>
+              <p>Nodes move through <code>PENDING</code>, <code>RUNNING</code>, <code>COMPLETED</code>, or <code>FAILED</code>.</p>
+            </article>
+            <article class="feature">
+              <div class="feature-mark"></div>
+              <h3>Lease safety</h3>
+              <p>Workers acquire leases, heartbeat while running, and stale work rolls back to <code>PENDING</code>.</p>
+            </article>
+            <article class="feature">
+              <div class="feature-mark"></div>
+              <h3>Model agnostic</h3>
+              <p>Python, Node, Rust, and shell clients can coordinate through Unix Domain Socket JSON Lines IPC.</p>
+            </article>
+            <article class="feature">
+              <div class="feature-mark"></div>
+              <h3>Low overhead</h3>
+              <p>No network service is required. The daemon runs locally as a small Rust binary.</p>
+            </article>
+            <article class="feature">
+              <div class="feature-mark"></div>
+              <h3>Runtime discovery</h3>
+              <p>Agents can call <code>DescribeInterface</code> to learn supported methods and payload shapes.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="interface">
+        <div class="section-inner split">
+          <div class="copy">
+            <p class="section-kicker">Runtime interface</p>
+            <h2>Ask the daemon what it supports.</h2>
+            <p>
+              The IPC contract is discoverable at runtime. Send one JSON object per line to the
+              Unix socket and read one JSON response per line.
+            </p>
+            <div class="method-list" aria-label="Supported methods">
+              <div class="method">DescribeInterface</div>
+              <div class="method">RegisterTask</div>
+              <div class="method">AcquireNextNode</div>
+              <div class="method">CommitEvent</div>
+              <div class="method">HeartbeatNode</div>
+              <div class="method">CompleteNode</div>
+              <div class="method">FailNode</div>
+              <div class="method">TaskStatus</div>
+            </div>
+          </div>
+          <pre class="terminal"><code>printf '%s\n' '{"id":1,"method":"DescribeInterface","params":{}}' \
+  | nc -U ~/.agentd/agentd.sock \
+  | python3 -m json.tool</code></pre>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <span>agentd.cc</span>
+      <span> | </span>
+      <span>Local-first daemon infrastructure for AI agent state.</span>
+    </footer>
+  </body>
+</html>
