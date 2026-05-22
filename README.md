@@ -115,6 +115,12 @@ Supported methods:
 
 Agents should call `DescribeInterface` when they do not have a generated or built-in client.
 
+Query it from a shell:
+
+```bash
+printf '%s\n' '{"id":1,"method":"DescribeInterface","params":{}}' | nc -U ~/.agentd/agentd.sock | python3 -m json.tool
+```
+
 ## Node Leases
 
 `AcquireNextNode` returns:
