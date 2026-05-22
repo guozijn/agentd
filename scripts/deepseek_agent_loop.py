@@ -11,7 +11,7 @@ import urllib.request
 import uuid
 
 
-DEFAULT_SOCKET_PATH = "/tmp/agentd.sock"
+DEFAULT_SOCKET_PATH = os.path.join(os.path.expanduser("~"), ".agentd", "agentd.sock")
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-flash"
 DEFAULT_ENV_FILE = os.path.join(os.path.expanduser("~"), ".agentd", ".env")

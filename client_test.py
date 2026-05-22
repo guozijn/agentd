@@ -5,7 +5,9 @@ import socket
 import uuid
 
 
-SOCKET_PATH = os.environ.get("AGENTD_SOCKET_PATH", "/tmp/agentd.sock")
+SOCKET_PATH = os.environ.get(
+    "AGENTD_SOCKET_PATH", os.path.expanduser("~/.agentd/agentd.sock")
+)
 
 
 def call(sock_file, request_id, method, params):

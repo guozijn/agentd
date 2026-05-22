@@ -29,7 +29,13 @@ By default, persistent state is stored under:
 ~/.agentd/agent_state.db
 ```
 
-This keeps runtime state out of the repository while preserving local-first operation. Override it with:
+By default, the Unix socket is also placed under:
+
+```text
+~/.agentd/agentd.sock
+```
+
+This keeps runtime state out of the repository while preserving local-first operation. Override the database with:
 
 ```bash
 AGENTD_DATABASE_URL=sqlite:///absolute/path/to/agent_state.db cargo run
@@ -45,12 +51,15 @@ AGENTD_HOME=/var/lib/agentd cargo run
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
+| `AGENTD_ENV_FILE` | `$HOME/.agentd/.env` then project `.env` fallback | Env file loaded at daemon and DeepSeek-loop startup |
 | `AGENTD_DATABASE_URL` | `sqlite://$HOME/.agentd/agent_state.db` | SQLite database URL |
 | `AGENTD_HOME` | `$HOME/.agentd` | Base directory used when `AGENTD_DATABASE_URL` is unset |
-| `AGENTD_SOCKET_PATH` | `/tmp/agentd.sock` | Unix socket path |
+| `AGENTD_SOCKET_PATH` | `$HOME/.agentd/agentd.sock` | Unix socket path |
 | `AGENTD_NODE_TIMEOUT_SECS` | `300` | Stale `RUNNING` node rollback threshold |
 | `AGENTD_CONTEXT_EVENT_LIMIT` | `50` | Maximum recent journal events included in acquired node context |
 | `RUST_LOG` | `agentd=info` | Logging filter |
+
+The daemon loads `AGENTD_ENV_FILE` if set, otherwise `$HOME/.agentd/.env` when present, otherwise a project-local `.env` as a development fallback. Existing process environment variables override values from the env file.
 
 ## Run The Daemon
 
