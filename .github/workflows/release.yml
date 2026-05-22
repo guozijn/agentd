@@ -55,7 +55,7 @@ jobs:
           staging="dist/agentd-${{ matrix.target }}"
           mkdir -p "$staging"
           cp "target/${{ matrix.target }}/release/agentd" "$staging/"
-          cp README.md LICENSE client_test.py "$staging/"
+          cp README.md LICENSE .env.example client_test.py "$staging/"
           cp scripts/deepseek_agent_loop.py "$staging/"
           tar -czf "dist/$archive" -C dist "agentd-${{ matrix.target }}"
           shasum -a 256 "dist/$archive" > "dist/$archive.sha256"

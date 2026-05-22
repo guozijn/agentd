@@ -1,124 +1,55 @@
 # agentd
 
-`agentd` is a local-first, out-of-process state machine daemon for AI agents. It owns durable task state, DAG node transitions, and an append-only event journal so Python, Node, or other agent runtimes can crash and resume without becoming the source of truth.
+`agentd` is a local-first state machine daemon for AI agents. It runs out of process, stores task state in SQLite, and exposes a Unix Domain Socket (UDS) JSON Lines API so agent runtimes can coordinate long-running DAG work without becoming the source of truth.
 
-The daemon is model-agnostic. Agents communicate over a Unix Domain Socket using newline-delimited JSON-RPC style messages.
+## Features
 
-## Current MVP
+- Durable SQLite state under `~/.agentd`
+- Strict DAG node states: `PENDING`, `RUNNING`, `COMPLETED`, `FAILED`
+- Lease-based node acquisition with heartbeat and timeout rollback
+- Append-only event journal
+- Runtime interface discovery: `DescribeInterface`
+- Health and metrics endpoints: `Health`, `Metrics`
+- Versioned schema migrations
+- Real DeepSeek multi-agent loop example
+- CI, tests, and release packaging
 
-- Rust 2021 daemon built on `tokio`
-- Unix Domain Socket IPC with JSON Lines framing
-- Embedded SQLite via `sqlx`
-- Durable task, DAG node, and event journal tables
-- Versioned schema migrations with legacy MVP database adoption
-- Strict node states: `PENDING`, `RUNNING`, `COMPLETED`, `FAILED`
-- Dependency-aware node acquisition
-- Lease IDs, heartbeats, and timeout rollback for stale `RUNNING` nodes
-- Bounded context journals to keep agent prompts small
-- Runtime IPC discovery through `DescribeInterface`
-- Health checks through `Health`
-- Structured runtime and database metrics through `Metrics`
-- Daemon-level IPC integration tests for worker coordination and protocol limits
-- Python smoke clients, including a real DeepSeek-backed multi-agent loop
+## Install / Run
 
-## Storage
-
-By default, persistent state is stored under:
-
-```text
-~/.agentd/agent_state.db
-```
-
-By default, the Unix socket is also placed under:
-
-```text
-~/.agentd/agentd.sock
-```
-
-This keeps runtime state out of the repository while preserving local-first operation. Override the database with:
+Development:
 
 ```bash
-AGENTD_DATABASE_URL=sqlite:///absolute/path/to/agent_state.db cargo run
+cargo run
 ```
 
-You can also set `AGENTD_HOME` to change the default state directory:
+Built binary:
 
 ```bash
-AGENTD_HOME=/var/lib/agentd cargo run
+cargo build --release
+./target/release/agentd
 ```
+
+Downloaded release binary:
+
+```bash
+./agentd
+```
+
+Cargo is not required to run a built or downloaded binary.
+
+## Default Paths
+
+| Item | Default |
+| --- | --- |
+| Env file | `~/.agentd/.env` |
+| SQLite DB | `~/.agentd/agent_state.db` |
+| UDS socket | `~/.agentd/agentd.sock` |
+
+Process environment variables override values from the env file.
 
 ## Configuration
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `AGENTD_ENV_FILE` | `$HOME/.agentd/.env` then project `.env` fallback | Env file loaded at daemon and DeepSeek-loop startup |
-| `AGENTD_DATABASE_URL` | `sqlite://$HOME/.agentd/agent_state.db` | SQLite database URL |
-| `AGENTD_HOME` | `$HOME/.agentd` | Base directory used when `AGENTD_DATABASE_URL` is unset |
-| `AGENTD_SOCKET_PATH` | `$HOME/.agentd/agentd.sock` | Unix socket path |
-| `AGENTD_NODE_TIMEOUT_SECS` | `300` | Stale `RUNNING` node rollback threshold |
-| `AGENTD_CONTEXT_EVENT_LIMIT` | `50` | Maximum recent journal events included in acquired node context |
-| `RUST_LOG` | `agentd=info` | Logging filter |
-
-The daemon loads `AGENTD_ENV_FILE` if set, otherwise `$HOME/.agentd/.env` when present, otherwise a project-local `.env` as a development fallback. Existing process environment variables override values from the env file.
-
-## Run The Daemon
-
-```bash
-cargo run
-```
-
-The daemon removes stale socket files on startup and sets the socket permissions to `0660`. Authentication is intentionally left to Unix file permissions for the MVP.
-
-## IPC Methods
-
-Requests are one JSON object per line:
-
-```json
-{"id":1,"method":"RegisterTask","params":{"goal":"demo","context":{},"initial_nodes":[]}}
-```
-
-Responses are also one JSON object per line:
-
-```json
-{"id":1,"result":{"task_id":"..."}}
-```
-
-Supported methods:
-
-| Method | Purpose |
-| --- | --- |
-| `DescribeInterface` | Return the runtime IPC contract so agents can discover supported methods |
-| `Health` | Check daemon and SQLite reachability |
-| `Metrics` | Return low-overhead runtime counters and database gauges |
-| `RegisterTask` | Create a task and initial DAG nodes |
-| `AcquireNextNode` | Acquire the next runnable `PENDING` node, mark it `RUNNING`, and return a `lease_id` |
-| `CommitEvent` | Append an event to the durable journal; include `lease_id` while the node is `RUNNING` |
-| `HeartbeatNode` | Extend a `RUNNING` node lease with the current `lease_id` |
-| `CompleteNode` | Mark a `RUNNING` node `COMPLETED` with the current `lease_id` and persist its result |
-| `FailNode` | Mark a `RUNNING` node `FAILED` with the current `lease_id` and persist the error |
-| `TaskStatus` | Return task metadata, status counts, and nodes |
-
-Agents should call `DescribeInterface` first when they are not using a prebuilt client. This lets an autonomous worker discover the protocol, node state model, method names, parameter shapes, and result shapes directly from the daemon instead of relying on copied documentation.
-
-When an agent acquires a node, the response includes `lease_id`, `lease_owner`, and `lease_expires_at`. Worker-side `CommitEvent`, `HeartbeatNode`, `CompleteNode`, and `FailNode` calls must send the current `lease_id`. If a worker stalls past `AGENTD_NODE_TIMEOUT_SECS`, the daemon rolls the node back to `PENDING`; a later worker receives a new lease, and stale calls using the old lease are rejected.
-
-## Python Smoke Test
-
-In one terminal:
-
-```bash
-cargo run
-```
-
-In another:
-
-```bash
-python3 client_test.py
-```
-
-## DeepSeek Multi-Agent Loop
-
-Create the agentd config directory and copy the example env file there:
+Create config:
 
 ```bash
 mkdir -p ~/.agentd
@@ -126,69 +57,122 @@ cp .env.example ~/.agentd/.env
 chmod 600 ~/.agentd/.env
 ```
 
-Then set `DEEPSEEK_API_KEY` in `~/.agentd/.env`. The DeepSeek loop reads this path by default. A project-local `.env` is still supported as a development fallback, but real secrets should live outside the repository.
+Important variables:
 
-Then run:
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `AGENTD_ENV_FILE` | `~/.agentd/.env` | Env file path |
+| `AGENTD_HOME` | `~/.agentd` | Base state directory |
+| `AGENTD_DATABASE_URL` | `sqlite://~/.agentd/agent_state.db` | SQLite URL |
+| `AGENTD_SOCKET_PATH` | `~/.agentd/agentd.sock` | UDS path |
+| `AGENTD_NODE_TIMEOUT_SECS` | `300` | Lease timeout |
+| `AGENTD_CONTEXT_EVENT_LIMIT` | `50` | Recent events included in acquired-node context |
+| `RUST_LOG` | `agentd=info` | Logging filter |
+
+DeepSeek loop variables:
+
+| Variable | Default |
+| --- | --- |
+| `DEEPSEEK_API_KEY` | required |
+| `DEEPSEEK_MODEL` | `deepseek-v4-flash` |
+| `DEEPSEEK_MAX_TOKENS` | `120` |
+| `DEEPSEEK_TEMPERATURE` | `0.2` |
+| `AGENTD_AGENT_WORKERS` | `2` |
+
+## IPC Protocol
+
+Transport: Unix Domain Socket
+
+Framing: one JSON request per line, one JSON response per line
+
+Request:
+
+```json
+{"id":1,"method":"Health","params":{}}
+```
+
+Response:
+
+```json
+{"id":1,"result":{"status":"ok","database":"ok","running_timeout_secs":300,"context_event_limit":50}}
+```
+
+Supported methods:
+
+| Method | Purpose |
+| --- | --- |
+| `DescribeInterface` | Return protocol and method schema |
+| `Health` | Check daemon and SQLite readiness |
+| `Metrics` | Return runtime counters and DB gauges |
+| `RegisterTask` | Create a task and DAG nodes |
+| `AcquireNextNode` | Lease the next runnable node |
+| `CommitEvent` | Append a journal event |
+| `HeartbeatNode` | Extend a node lease |
+| `CompleteNode` | Complete a leased node |
+| `FailNode` | Fail a leased node |
+| `TaskStatus` | Return task and node state |
+
+Agents should call `DescribeInterface` when they do not have a generated or built-in client.
+
+## Node Leases
+
+`AcquireNextNode` returns:
+
+- `node_id`
+- `lease_id`
+- `lease_owner`
+- `lease_expires_at`
+- synthesised execution context
+
+Workers must pass the current `lease_id` to `CommitEvent`, `HeartbeatNode`, `CompleteNode`, and `FailNode`. If a worker stalls past `AGENTD_NODE_TIMEOUT_SECS`, the daemon rolls the node back to `PENDING`; a later worker gets a new lease, and stale lease writes are rejected.
+
+## Smoke Tests
+
+Start daemon:
 
 ```bash
 cargo run
 ```
 
-In another terminal:
+Basic Python client:
+
+```bash
+python3 client_test.py
+```
+
+Real DeepSeek multi-agent loop:
 
 ```bash
 python3 scripts/deepseek_agent_loop.py
 ```
 
-The loop registers a four-node DAG:
-
-1. `architecture_lead`
-2. `performance_guardian`
-3. `reliability_reviewer`
-4. `release_synthesiser`
-
-Two workers coordinate through `agentd`; the daemon controls dependency readiness and state transitions. The script defaults to `deepseek-v4-flash`, disables thinking mode for V4 models, and keeps `max_tokens` low to control cost.
-
-Useful overrides:
-
-```bash
-DEEPSEEK_MODEL=deepseek-v4-flash \
-DEEPSEEK_MAX_TOKENS=120 \
-AGENTD_AGENT_WORKERS=2 \
-python3 scripts/deepseek_agent_loop.py
-```
-
-To use a different env file:
-
-```bash
-AGENTD_ENV_FILE=/path/to/env python3 scripts/deepseek_agent_loop.py
-```
+The DeepSeek loop registers a four-node DAG: architecture, performance, reliability review, and release synthesis. It uses `deepseek-v4-flash`, bounded prompts, and low token defaults.
 
 ## Development Checks
 
 ```bash
 cargo fmt --check
-cargo check
-cargo test
+cargo check --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
 cargo package --locked
+python3 -m py_compile client_test.py scripts/deepseek_agent_loop.py
 ```
 
-## Release Packaging
+## Release
 
-GitHub Actions runs CI on pushes and pull requests. Release artifacts are produced by pushing a tag:
+CI runs on pushes and pull requests. Release artifacts are built from tags:
 
 ```bash
 git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The release workflow builds Linux and macOS binaries, packs `.tar.gz` archives with checksums, and publishes them to a GitHub Release.
+The release workflow builds Linux and macOS binaries, packs `.tar.gz` archives, writes SHA-256 checksums, and publishes a GitHub Release.
 
-## Production Direction
+## Remaining Hardening
 
-The MVP is intentionally small. The next production-hardening slices are:
-
-- Multi-version migration coverage as the schema evolves beyond v1
-- Lease owner IDs in richer diagnostics
-- Backpressure beyond the current bounded 1 MiB request lines
+- Multi-version migration tests as schema evolves
+- Richer lease diagnostics
+- Backpressure beyond bounded 1 MiB request lines
 - Optional Prometheus text export or systemd watchdog integration
