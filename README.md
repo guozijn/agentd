@@ -78,6 +78,7 @@ DeepSeek loop variables:
 | `DEEPSEEK_MAX_TOKENS` | `120` |
 | `DEEPSEEK_TEMPERATURE` | `0.2` |
 | `AGENTD_AGENT_WORKERS` | `2` |
+| `AGENTD_ARTIFACT_DIR` | `~/.agentd/artifacts` |
 
 ## IPC Protocol
 
@@ -146,4 +147,4 @@ Real DeepSeek multi-agent loop:
 python3 scripts/deepseek_agent_loop.py
 ```
 
-The DeepSeek loop registers a four-node DAG: architecture, performance, reliability review, and release synthesis. It uses `deepseek-v4-flash`, bounded prompts, and low token defaults.
+The DeepSeek loop registers a four-node DAG: one agent writes a compact Python worker script, one concurrently writes the IPC contract, one waits for both and reviews integration safety, and one waits last to synthesise the result. Generated artifacts are written under `~/.agentd/artifacts` by default.

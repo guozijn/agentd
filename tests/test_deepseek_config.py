@@ -24,6 +24,7 @@ class DeepSeekConfigTests(unittest.TestCase):
                     "DEEPSEEK_MAX_TOKENS=37",
                     "DEEPSEEK_TEMPERATURE=0.7",
                     "AGENTD_AGENT_WORKERS=3",
+                    "AGENTD_ARTIFACT_DIR=/tmp/agentd-artifacts",
                 ]
             )
         )
@@ -37,6 +38,7 @@ class DeepSeekConfigTests(unittest.TestCase):
         self.assertEqual(args.max_tokens, 37)
         self.assertEqual(args.temperature, 0.7)
         self.assertEqual(args.workers, 3)
+        self.assertEqual(args.artifact_dir, "/tmp/agentd-artifacts")
 
     def test_process_environment_overrides_env_file(self):
         env_file = self.write_env("DEEPSEEK_MODEL=file-model\n")

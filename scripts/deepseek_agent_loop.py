@@ -18,6 +18,7 @@ DEFAULT_MAX_TOKENS = 120
 DEFAULT_TEMPERATURE = 0.2
 DEFAULT_WORKERS = 2
 DEFAULT_ENV_FILE = os.path.join(os.path.expanduser("~"), ".agentd", ".env")
+DEFAULT_ARTIFACT_DIR = os.path.join(os.path.expanduser("~"), ".agentd", "artifacts")
 
 
 class RpcClient:
@@ -130,47 +131,47 @@ def deepseek_chat(api_key, base_url, model, messages, max_tokens, temperature):
 
 
 def build_agent_nodes():
-    architecture_id = str(uuid.uuid4())
-    performance_id = str(uuid.uuid4())
+    script_id = str(uuid.uuid4())
+    contract_id = str(uuid.uuid4())
     reviewer_id = str(uuid.uuid4())
     synthesiser_id = str(uuid.uuid4())
 
     return [
         {
-            "id": architecture_id,
+            "id": script_id,
             "dependencies": [],
             "payload_schema": {
-                "agent": "architecture_lead",
-                "objective": "Identify the minimum production architecture changes for a local-first AI agent state daemon.",
+                "agent": "agent_script_author",
+                "objective": "Write a tiny Python child-agent script. It must not open sockets. It reads one JSON object from stdin and writes one JSON object to stdout.",
                 "output_contract": {
-                    "summary": "one concise paragraph",
-                    "state_invariants": "short list",
-                    "next_actions": "short list",
+                    "filename": "agent_worker_example.py",
+                    "code": "complete Python code, 12 lines or fewer",
+                    "notes": "short list",
                 },
             },
         },
         {
-            "id": performance_id,
+            "id": contract_id,
             "dependencies": [],
             "payload_schema": {
-                "agent": "performance_guardian",
-                "objective": "Minimise resource cost for long-running local AI orchestration while preserving crash resilience.",
+                "agent": "operator_contract_author",
+                "objective": "Write the minimal IPC contract an external agent needs to use agentd safely.",
                 "output_contract": {
                     "summary": "one concise paragraph",
-                    "cost_controls": "short list",
-                    "risks": "short list",
+                    "required_calls": "short list",
+                    "lease_rules": "short list",
                 },
             },
         },
         {
             "id": reviewer_id,
-            "dependencies": [architecture_id, performance_id],
+            "dependencies": [script_id, contract_id],
             "payload_schema": {
-                "agent": "reliability_reviewer",
-                "objective": "Review dependency outputs and find reliability gaps before this daemon is used by multiple agents.",
+                "agent": "integration_reviewer",
+                "objective": "Review the generated script and IPC contract for sequential handoff and concurrent worker safety.",
                 "output_contract": {
                     "summary": "one concise paragraph",
-                    "blocking_gaps": "short list",
+                    "findings": "short list",
                     "acceptance_checks": "short list",
                 },
             },
@@ -179,12 +180,12 @@ def build_agent_nodes():
             "id": synthesiser_id,
             "dependencies": [reviewer_id],
             "payload_schema": {
-                "agent": "release_synthesiser",
-                "objective": "Synthesize a production-readiness verdict and the smallest next implementation slice.",
+                "agent": "final_synthesiser",
+                "objective": "Synthesize what the generated artifacts prove about sequential and concurrent agent coordination.",
                 "output_contract": {
-                    "verdict": "ship or hold",
+                    "verdict": "pass or fail",
                     "evidence": "short list",
-                    "next_slice": "short list",
+                    "next_step": "short list",
                 },
             },
         },
@@ -253,6 +254,7 @@ def build_messages(acquired):
             "Do not ask follow-up questions.",
             "Use task_context.observed_daemon as current-state evidence.",
             "Do not report an implemented_features item as missing.",
+            "Return valid compact JSON only.",
             "Prefer low-cost, high-performance infrastructure decisions.",
             "Keep the response under 140 words.",
         ],
@@ -368,7 +370,7 @@ def run(args):
     registered = rpc.call(
         "RegisterTask",
         {
-            "goal": "Coordinate specialised AI agents to assess and improve agentd as production local-first infrastructure.",
+            "goal": "Coordinate specialised AI agents to generate and review a minimal external agent worker script for agentd.",
             "context": {
                 "repository": "agentd",
                 "cost_policy": "Use the flash model, short prompts, bounded context, and low max_tokens.",
@@ -411,6 +413,11 @@ def run(args):
 
     status = rpc.call("TaskStatus", {"task_id": task_id})
     print(json.dumps(status, indent=2), flush=True)
+    artifacts = write_artifacts(status, args.artifact_dir)
+    if artifacts:
+        print(f"wrote artifacts: {artifacts['output_dir']}", flush=True)
+        if not artifacts["script_path"]:
+            raise SystemExit("agent_script_author did not produce a parseable code artifact")
     failed = status["counts"].get("FAILED", 0)
     if failed:
         raise SystemExit(f"{failed} node(s) failed")
@@ -445,6 +452,57 @@ def guarded_worker(
         done.set()
 
 
+def parse_json_content(content):
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        start = content.find("{")
+        end = content.rfind("}")
+        if start == -1 or end <= start:
+            return None
+        try:
+            return json.loads(content[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+
+
+def safe_artifact_name(value, default):
+    name = os.path.basename(str(value or default)).strip()
+    return name or default
+
+
+def write_artifacts(status, artifact_dir):
+    if not artifact_dir:
+        return None
+
+    task_id = status["task"]["id"]
+    output_dir = os.path.join(os.path.expanduser(artifact_dir), task_id)
+    os.makedirs(output_dir, mode=0o700, exist_ok=True)
+
+    script_path = None
+    for node in status["nodes"]:
+        payload_schema = node.get("payload_schema", {})
+        agent = safe_artifact_name(payload_schema.get("agent"), "agent")
+        result_payload = node.get("result_payload") or {}
+        content = result_payload.get("content", "")
+
+        with open(os.path.join(output_dir, f"{agent}.md"), "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.write("\n")
+
+        parsed = parse_json_content(content)
+        if agent == "agent_script_author" and isinstance(parsed, dict):
+            code = parsed.get("code")
+            if isinstance(code, str) and code.strip():
+                filename = safe_artifact_name(parsed.get("filename"), "agent_worker_example.py")
+                script_path = os.path.join(output_dir, filename)
+                with open(script_path, "w", encoding="utf-8") as handle:
+                    handle.write(code.rstrip())
+                    handle.write("\n")
+
+    return {"output_dir": output_dir, "script_path": script_path}
+
+
 def parse_args(argv=None):
     env_parser = argparse.ArgumentParser(add_help=False)
     env_parser.add_argument("--env-file", default=default_env_file())
@@ -476,6 +534,10 @@ def parse_args(argv=None):
         "--workers",
         type=positive_int,
         default=env_positive_int("AGENTD_AGENT_WORKERS", DEFAULT_WORKERS),
+    )
+    parser.add_argument(
+        "--artifact-dir",
+        default=os.environ.get("AGENTD_ARTIFACT_DIR", DEFAULT_ARTIFACT_DIR),
     )
     return parser.parse_args(argv)
 
