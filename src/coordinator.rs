@@ -283,11 +283,9 @@ impl Coordinator {
             .metrics
             .acquisition_latency_micros_total
             .load(Ordering::Relaxed);
-        let average_acquisition_latency_micros = if acquire_attempts == 0 {
-            0
-        } else {
-            acquisition_latency_micros_total / acquire_attempts
-        };
+        let average_acquisition_latency_micros = acquisition_latency_micros_total
+            .checked_div(acquire_attempts)
+            .unwrap_or(0);
 
         RuntimeMetricsSnapshot {
             registered_tasks: self.metrics.registered_tasks.load(Ordering::Relaxed),
