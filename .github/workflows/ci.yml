@@ -36,5 +36,7 @@ jobs:
       - name: Package crate
         run: cargo package --locked
 
-      - name: Python syntax check
-        run: python3 -m py_compile client_test.py scripts/deepseek_agent_loop.py
+      - name: Python checks
+        run: |
+          python3 -m py_compile client_test.py scripts/deepseek_agent_loop.py
+          python3 -m unittest discover -s tests -p 'test_*.py'

@@ -14,6 +14,9 @@ import uuid
 DEFAULT_SOCKET_PATH = os.path.join(os.path.expanduser("~"), ".agentd", "agentd.sock")
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-v4-flash"
+DEFAULT_MAX_TOKENS = 120
+DEFAULT_TEMPERATURE = 0.2
+DEFAULT_WORKERS = 2
 DEFAULT_ENV_FILE = os.path.join(os.path.expanduser("~"), ".agentd", ".env")
 
 
@@ -55,6 +58,39 @@ def load_dotenv(path=".env"):
             key = key.strip()
             value = value.strip().strip('"').strip("'")
             os.environ.setdefault(key, value)
+
+
+def env_positive_int(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise SystemExit(f"{name} must be an integer, got {value!r}") from exc
+    if parsed < 1:
+        raise SystemExit(f"{name} must be at least 1, got {value!r}")
+    return parsed
+
+
+def env_float(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise SystemExit(f"{name} must be a number, got {value!r}") from exc
+
+
+def positive_int(value):
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{value!r} is not an integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
 
 
 def deepseek_chat(api_key, base_url, model, messages, max_tokens, temperature):
@@ -155,6 +191,48 @@ def build_agent_nodes():
     ]
 
 
+def collect_daemon_facts(rpc):
+    interface = rpc.call("DescribeInterface", {})
+    health = rpc.call("Health", {})
+    metrics = rpc.call("Metrics", {})
+    database = metrics.get("database", {})
+    runtime = metrics.get("runtime", {})
+    state_model = interface.get("state_model", {})
+
+    return {
+        "protocol": interface.get("protocol"),
+        "methods": [method.get("method") for method in interface.get("methods", [])],
+        "node_statuses": state_model.get("node_statuses", []),
+        "strict_transitions": state_model.get("strict_transitions", {}),
+        "health": health,
+        "database": {
+            "schema_version": database.get("schema_version"),
+            "latest_schema_version": database.get("latest_schema_version"),
+            "total_tasks": database.get("total_tasks"),
+            "total_nodes": database.get("total_nodes"),
+            "total_events": database.get("total_events"),
+            "running_leases": database.get("running_leases"),
+            "expired_running_leases": database.get("expired_running_leases"),
+        },
+        "runtime": {
+            "average_acquisition_latency_micros": runtime.get(
+                "average_acquisition_latency_micros"
+            ),
+            "timeout_rollbacks": runtime.get("timeout_rollbacks"),
+            "failed_nodes": runtime.get("failed_nodes"),
+        },
+        "implemented_features": [
+            "SQLite WAL persistence",
+            "Unix Domain Socket JSON Lines IPC",
+            "runtime interface discovery",
+            "dependency-aware DAG acquisition",
+            "lease IDs with heartbeat and timeout rollback",
+            "bounded event context for low prompt cost",
+            "health and metrics endpoints",
+        ],
+    }
+
+
 def build_messages(acquired):
     context = acquired["context"]
     node = context["node"]
@@ -173,6 +251,8 @@ def build_messages(acquired):
         "completed_dependency_results": dependency_results,
         "instructions": [
             "Do not ask follow-up questions.",
+            "Use task_context.observed_daemon as current-state evidence.",
+            "Do not report an implemented_features item as missing.",
             "Prefer low-cost, high-performance infrastructure decisions.",
             "Keep the response under 140 words.",
         ],
@@ -284,6 +364,7 @@ def run(args):
         raise SystemExit("DEEPSEEK_API_KEY is not set; add it to .env or the environment")
 
     rpc = RpcClient(args.socket_path)
+    daemon_facts = collect_daemon_facts(rpc)
     registered = rpc.call(
         "RegisterTask",
         {
@@ -292,6 +373,7 @@ def run(args):
                 "repository": "agentd",
                 "cost_policy": "Use the flash model, short prompts, bounded context, and low max_tokens.",
                 "daemon_role": "Single source of truth for agent task state and strict DAG transitions.",
+                "observed_daemon": daemon_facts,
             },
             "initial_nodes": build_agent_nodes(),
         },
@@ -363,22 +445,39 @@ def guarded_worker(
         done.set()
 
 
-def parse_args():
+def parse_args(argv=None):
+    env_parser = argparse.ArgumentParser(add_help=False)
+    env_parser.add_argument("--env-file", default=default_env_file())
+    env_args, _ = env_parser.parse_known_args(argv)
+    load_dotenv(env_args.env_file)
+
     parser = argparse.ArgumentParser(
-        description="Run a real DeepSeek-backed multi-agent loop against agentd."
+        description="Run a real DeepSeek-backed multi-agent loop against agentd.",
+        parents=[env_parser],
     )
     parser.add_argument(
         "--socket-path", default=os.environ.get("AGENTD_SOCKET_PATH", DEFAULT_SOCKET_PATH)
     )
-    parser.add_argument("--env-file", default=default_env_file())
     parser.add_argument(
         "--base-url", default=os.environ.get("DEEPSEEK_BASE_URL", DEFAULT_BASE_URL)
     )
     parser.add_argument("--model", default=os.environ.get("DEEPSEEK_MODEL", DEFAULT_MODEL))
-    parser.add_argument("--max-tokens", type=int, default=int(os.environ.get("DEEPSEEK_MAX_TOKENS", "180")))
-    parser.add_argument("--temperature", type=float, default=float(os.environ.get("DEEPSEEK_TEMPERATURE", "0.2")))
-    parser.add_argument("--workers", type=int, default=int(os.environ.get("AGENTD_AGENT_WORKERS", "2")))
-    return parser.parse_args()
+    parser.add_argument(
+        "--max-tokens",
+        type=positive_int,
+        default=env_positive_int("DEEPSEEK_MAX_TOKENS", DEFAULT_MAX_TOKENS),
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=env_float("DEEPSEEK_TEMPERATURE", DEFAULT_TEMPERATURE),
+    )
+    parser.add_argument(
+        "--workers",
+        type=positive_int,
+        default=env_positive_int("AGENTD_AGENT_WORKERS", DEFAULT_WORKERS),
+    )
+    return parser.parse_args(argv)
 
 
 def default_env_file():

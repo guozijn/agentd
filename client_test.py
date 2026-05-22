@@ -86,6 +86,24 @@ def main():
         acquired = call(sock_file, 5, "AcquireNextNode", {"task_id": task_id})
         print("second acquire:", json.dumps(acquired, indent=2))
 
+        node_id = acquired["node_id"]
+        lease_id = acquired["lease_id"]
+        completed = call(
+            sock_file,
+            6,
+            "CompleteNode",
+            {
+                "task_id": task_id,
+                "node_id": node_id,
+                "lease_id": lease_id,
+                "result_payload": {"ok": True, "value": "second node complete"},
+            },
+        )
+        print("completed second node:", completed["event_id"])
+
+        status = call(sock_file, 7, "TaskStatus", {"task_id": task_id})
+        print("final counts:", json.dumps(status["counts"], sort_keys=True))
+
 
 if __name__ == "__main__":
     main()

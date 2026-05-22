@@ -4,10 +4,11 @@ on:
   push:
     tags:
       - "v*"
+      - "[0-9]*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to publish, for example v0.1.0"
+        description: "Release tag to publish, for example 0.1.0 or v0.1.0"
         required: true
 
 permissions:

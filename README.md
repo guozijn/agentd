@@ -12,7 +12,6 @@
 - Health and metrics endpoints: `Health`, `Metrics`
 - Versioned schema migrations
 - Real DeepSeek multi-agent loop example
-- CI, tests, and release packaging
 
 ## Install / Run
 
@@ -74,6 +73,7 @@ DeepSeek loop variables:
 | Variable | Default |
 | --- | --- |
 | `DEEPSEEK_API_KEY` | required |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` |
 | `DEEPSEEK_MODEL` | `deepseek-v4-flash` |
 | `DEEPSEEK_MAX_TOKENS` | `120` |
 | `DEEPSEEK_TEMPERATURE` | `0.2` |
@@ -147,32 +147,3 @@ python3 scripts/deepseek_agent_loop.py
 ```
 
 The DeepSeek loop registers a four-node DAG: architecture, performance, reliability review, and release synthesis. It uses `deepseek-v4-flash`, bounded prompts, and low token defaults.
-
-## Development Checks
-
-```bash
-cargo fmt --check
-cargo check --locked
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
-cargo package --locked
-python3 -m py_compile client_test.py scripts/deepseek_agent_loop.py
-```
-
-## Release
-
-CI runs on pushes and pull requests. Release artifacts are built from tags:
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-The release workflow builds Linux and macOS binaries, packs `.tar.gz` archives, writes SHA-256 checksums, and publishes a GitHub Release.
-
-## Remaining Hardening
-
-- Multi-version migration tests as schema evolves
-- Richer lease diagnostics
-- Backpressure beyond bounded 1 MiB request lines
-- Optional Prometheus text export or systemd watchdog integration
