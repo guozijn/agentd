@@ -219,6 +219,7 @@ async fn handle_request(request: RpcRequest, coordinator: Arc<Coordinator>) -> R
     let result = match request.method.as_str() {
         "DescribeInterface" | "describe_interface" => Ok(describe_interface()),
         "Health" | "health" => health(coordinator).await,
+        "Metrics" | "metrics" => metrics(coordinator).await,
         "RegisterTask" | "register_task" => register_task(request.params, coordinator).await,
         "AcquireNextNode" | "acquire_next_node" => {
             acquire_next_node(request.params, coordinator).await
@@ -269,6 +270,15 @@ fn describe_interface() -> Value {
                     "database": "ok",
                     "running_timeout_secs": "integer",
                     "context_event_limit": "integer"
+                }
+            },
+            {
+                "method": "Metrics",
+                "params": {},
+                "result": {
+                    "uptime_secs": "integer",
+                    "runtime": "object",
+                    "database": "object"
                 }
             },
             {
@@ -349,6 +359,10 @@ fn describe_interface() -> Value {
 
 async fn health(coordinator: Arc<Coordinator>) -> Result<Value, RequestError> {
     Ok(serde_json::to_value(coordinator.health().await?)?)
+}
+
+async fn metrics(coordinator: Arc<Coordinator>) -> Result<Value, RequestError> {
+    Ok(serde_json::to_value(coordinator.metrics().await?)?)
 }
 
 async fn register_task(

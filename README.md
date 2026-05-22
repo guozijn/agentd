@@ -10,12 +10,14 @@ The daemon is model-agnostic. Agents communicate over a Unix Domain Socket using
 - Unix Domain Socket IPC with JSON Lines framing
 - Embedded SQLite via `sqlx`
 - Durable task, DAG node, and event journal tables
+- Versioned schema migrations with legacy MVP database adoption
 - Strict node states: `PENDING`, `RUNNING`, `COMPLETED`, `FAILED`
 - Dependency-aware node acquisition
 - Lease IDs, heartbeats, and timeout rollback for stale `RUNNING` nodes
 - Bounded context journals to keep agent prompts small
 - Runtime IPC discovery through `DescribeInterface`
 - Health checks through `Health`
+- Structured runtime and database metrics through `Metrics`
 - Python smoke clients, including a real DeepSeek-backed multi-agent loop
 
 ## Storage
@@ -77,6 +79,7 @@ Supported methods:
 | --- | --- |
 | `DescribeInterface` | Return the runtime IPC contract so agents can discover supported methods |
 | `Health` | Check daemon and SQLite reachability |
+| `Metrics` | Return low-overhead runtime counters and database gauges |
 | `RegisterTask` | Create a task and initial DAG nodes |
 | `AcquireNextNode` | Acquire the next runnable `PENDING` node, mark it `RUNNING`, and return a `lease_id` |
 | `CommitEvent` | Append an event to the durable journal; include `lease_id` while the node is `RUNNING` |
@@ -157,6 +160,7 @@ AGENTD_ENV_FILE=/path/to/env python3 scripts/deepseek_agent_loop.py
 cargo fmt --check
 cargo check
 cargo test
+cargo package --locked
 ```
 
 ## Release Packaging
@@ -174,9 +178,8 @@ The release workflow builds Linux and macOS binaries, packs `.tar.gz` archives w
 
 The MVP is intentionally small. The next production-hardening slices are:
 
-- Durable schema migrations instead of inline `CREATE TABLE IF NOT EXISTS`
-- Full durable schema migrations instead of compatibility `ALTER TABLE` checks
-- Lease owner IDs in metrics and diagnostics
+- Multi-version migration coverage as the schema evolves beyond v1
+- Lease owner IDs in richer diagnostics
 - Backpressure beyond the current bounded 1 MiB request lines
-- Structured metrics for acquisition latency, timeout rollbacks, and journal growth
 - Integration tests that launch the daemon and exercise concurrent workers
+- Optional Prometheus text export or systemd watchdog integration

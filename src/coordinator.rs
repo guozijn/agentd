@@ -1,7 +1,10 @@
-use crate::db::{DagNodeRow, Database, DbError, NodeDefinition, TaskSnapshot};
+use crate::db::{DagNodeRow, Database, DatabaseMetrics, DbError, NodeDefinition, TaskSnapshot};
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -22,6 +25,8 @@ pub struct Coordinator {
     db: Database,
     running_timeout: Duration,
     context_event_limit: u32,
+    started_at: Instant,
+    metrics: Arc<RuntimeMetrics>,
 }
 
 #[derive(Debug, Serialize)]
@@ -42,12 +47,50 @@ pub struct HealthStatus {
     pub context_event_limit: u32,
 }
 
+#[derive(Debug, Default)]
+struct RuntimeMetrics {
+    registered_tasks: AtomicU64,
+    acquire_attempts: AtomicU64,
+    acquired_nodes: AtomicU64,
+    acquisition_latency_micros_total: AtomicU64,
+    committed_events: AtomicU64,
+    heartbeats: AtomicU64,
+    completed_nodes: AtomicU64,
+    failed_nodes: AtomicU64,
+    timeout_rollbacks: AtomicU64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MetricsSnapshot {
+    pub uptime_secs: u64,
+    pub running_timeout_secs: u64,
+    pub context_event_limit: u32,
+    pub runtime: RuntimeMetricsSnapshot,
+    pub database: DatabaseMetrics,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RuntimeMetricsSnapshot {
+    pub registered_tasks: u64,
+    pub acquire_attempts: u64,
+    pub acquired_nodes: u64,
+    pub acquisition_latency_micros_total: u64,
+    pub average_acquisition_latency_micros: u64,
+    pub committed_events: u64,
+    pub heartbeats: u64,
+    pub completed_nodes: u64,
+    pub failed_nodes: u64,
+    pub timeout_rollbacks: u64,
+}
+
 impl Coordinator {
     pub fn new(db: Database, running_timeout: Duration, context_event_limit: u32) -> Self {
         Self {
             db,
             running_timeout,
             context_event_limit,
+            started_at: Instant::now(),
+            metrics: Arc::new(RuntimeMetrics::default()),
         }
     }
 
@@ -57,7 +100,11 @@ impl Coordinator {
         context: Value,
         initial_nodes: Vec<NodeDefinition>,
     ) -> Result<Uuid, CoordinatorError> {
-        Ok(self.db.register_task(goal, context, initial_nodes).await?)
+        let task_id = self.db.register_task(goal, context, initial_nodes).await?;
+        self.metrics
+            .registered_tasks
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(task_id)
     }
 
     pub async fn acquire_next_node(
@@ -65,10 +112,16 @@ impl Coordinator {
         task_id: Uuid,
         lease_owner: String,
     ) -> Result<Option<AcquiredNode>, CoordinatorError> {
+        let started_at = Instant::now();
+        self.metrics
+            .acquire_attempts
+            .fetch_add(1, Ordering::Relaxed);
         self.ensure_task_exists(task_id).await?;
-        self.db
+        let reset_count = self
+            .db
             .reset_timed_out_nodes(Some(task_id), self.running_timeout)
             .await?;
+        self.record_timeout_rollbacks(reset_count);
 
         let pending_nodes = self.db.pending_nodes(task_id).await?;
         for node in pending_nodes {
@@ -87,6 +140,8 @@ impl Coordinator {
                 .mark_node_running(task_id, node_id, &lease_owner, self.running_timeout)
                 .await?
             {
+                self.metrics.acquired_nodes.fetch_add(1, Ordering::Relaxed);
+                self.record_acquisition_latency(started_at);
                 let running_node = self
                     .db
                     .fetch_node(task_id, node_id)
@@ -104,6 +159,7 @@ impl Coordinator {
             }
         }
 
+        self.record_acquisition_latency(started_at);
         Ok(None)
     }
 
@@ -117,10 +173,14 @@ impl Coordinator {
     ) -> Result<Uuid, CoordinatorError> {
         self.ensure_node_exists(task_id, node_id).await?;
         let action_type = action_type.unwrap_or_else(|| "COMMIT_EVENT".to_string());
-        Ok(self
+        let event_id = self
             .db
             .append_event(task_id, node_id, lease_id, &action_type, payload)
-            .await?)
+            .await?;
+        self.metrics
+            .committed_events
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(event_id)
     }
 
     pub async fn heartbeat_node(
@@ -135,6 +195,7 @@ impl Coordinator {
             .heartbeat_node(task_id, node_id, lease_id, self.running_timeout)
             .await?
         {
+            self.metrics.heartbeats.fetch_add(1, Ordering::Relaxed);
             Ok(())
         } else {
             Err(CoordinatorError::NodeNotRunning { task_id, node_id })
@@ -149,10 +210,12 @@ impl Coordinator {
         result_payload: Value,
     ) -> Result<Uuid, CoordinatorError> {
         self.ensure_node_exists(task_id, node_id).await?;
-        Ok(self
+        let event_id = self
             .db
             .complete_node(task_id, node_id, lease_id, result_payload)
-            .await?)
+            .await?;
+        self.metrics.completed_nodes.fetch_add(1, Ordering::Relaxed);
+        Ok(event_id)
     }
 
     pub async fn fail_node(
@@ -163,10 +226,12 @@ impl Coordinator {
         error_payload: Value,
     ) -> Result<Uuid, CoordinatorError> {
         self.ensure_node_exists(task_id, node_id).await?;
-        Ok(self
+        let event_id = self
             .db
             .fail_node(task_id, node_id, lease_id, error_payload)
-            .await?)
+            .await?;
+        self.metrics.failed_nodes.fetch_add(1, Ordering::Relaxed);
+        Ok(event_id)
     }
 
     pub async fn task_status(&self, task_id: Uuid) -> Result<TaskSnapshot, CoordinatorError> {
@@ -177,10 +242,12 @@ impl Coordinator {
     }
 
     pub async fn reset_timed_out_nodes(&self) -> Result<u64, CoordinatorError> {
-        Ok(self
+        let count = self
             .db
             .reset_timed_out_nodes(None, self.running_timeout)
-            .await?)
+            .await?;
+        self.record_timeout_rollbacks(count);
+        Ok(count)
     }
 
     pub async fn health(&self) -> Result<HealthStatus, CoordinatorError> {
@@ -195,6 +262,60 @@ impl Coordinator {
 
     pub const fn running_timeout(&self) -> Duration {
         self.running_timeout
+    }
+
+    pub async fn metrics(&self) -> Result<MetricsSnapshot, CoordinatorError> {
+        let runtime = self.runtime_metrics_snapshot();
+        let database = self.db.metrics().await?;
+
+        Ok(MetricsSnapshot {
+            uptime_secs: self.started_at.elapsed().as_secs(),
+            running_timeout_secs: self.running_timeout.as_secs(),
+            context_event_limit: self.context_event_limit,
+            runtime,
+            database,
+        })
+    }
+
+    fn runtime_metrics_snapshot(&self) -> RuntimeMetricsSnapshot {
+        let acquire_attempts = self.metrics.acquire_attempts.load(Ordering::Relaxed);
+        let acquisition_latency_micros_total = self
+            .metrics
+            .acquisition_latency_micros_total
+            .load(Ordering::Relaxed);
+        let average_acquisition_latency_micros = if acquire_attempts == 0 {
+            0
+        } else {
+            acquisition_latency_micros_total / acquire_attempts
+        };
+
+        RuntimeMetricsSnapshot {
+            registered_tasks: self.metrics.registered_tasks.load(Ordering::Relaxed),
+            acquire_attempts,
+            acquired_nodes: self.metrics.acquired_nodes.load(Ordering::Relaxed),
+            acquisition_latency_micros_total,
+            average_acquisition_latency_micros,
+            committed_events: self.metrics.committed_events.load(Ordering::Relaxed),
+            heartbeats: self.metrics.heartbeats.load(Ordering::Relaxed),
+            completed_nodes: self.metrics.completed_nodes.load(Ordering::Relaxed),
+            failed_nodes: self.metrics.failed_nodes.load(Ordering::Relaxed),
+            timeout_rollbacks: self.metrics.timeout_rollbacks.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_acquisition_latency(&self, started_at: Instant) {
+        let micros = u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.metrics
+            .acquisition_latency_micros_total
+            .fetch_add(micros, Ordering::Relaxed);
+    }
+
+    fn record_timeout_rollbacks(&self, count: u64) {
+        if count > 0 {
+            self.metrics
+                .timeout_rollbacks
+                .fetch_add(count, Ordering::Relaxed);
+        }
     }
 
     async fn ensure_task_exists(&self, task_id: Uuid) -> Result<(), CoordinatorError> {
@@ -367,6 +488,56 @@ mod tests {
 
         assert_ne!(first.node_id, second.node_id);
         assert_ne!(first.lease_id, second.lease_id);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn metrics_track_state_machine_activity() {
+        let (coordinator, db_path) = test_coordinator(Duration::from_secs(60)).await;
+        let task_id = coordinator
+            .register_task("metrics test".to_string(), json!({}), one_node())
+            .await
+            .expect("task should register");
+        let acquired = coordinator
+            .acquire_next_node(task_id, "metrics-worker".to_string())
+            .await
+            .expect("acquire should succeed")
+            .expect("node should be runnable");
+
+        coordinator
+            .commit_event(
+                task_id,
+                acquired.node_id,
+                Some(acquired.lease_id),
+                Some("TEST_EVENT".to_string()),
+                json!({ "ok": true }),
+            )
+            .await
+            .expect("event should commit");
+        coordinator
+            .complete_node(
+                task_id,
+                acquired.node_id,
+                acquired.lease_id,
+                json!({ "done": true }),
+            )
+            .await
+            .expect("node should complete");
+
+        let metrics = coordinator.metrics().await.expect("metrics should load");
+        assert_eq!(metrics.runtime.registered_tasks, 1);
+        assert_eq!(metrics.runtime.acquire_attempts, 1);
+        assert_eq!(metrics.runtime.acquired_nodes, 1);
+        assert_eq!(metrics.runtime.committed_events, 1);
+        assert_eq!(metrics.runtime.completed_nodes, 1);
+        assert_eq!(metrics.database.total_tasks, 1);
+        assert_eq!(metrics.database.total_nodes, 1);
+        assert_eq!(metrics.database.total_events, 2);
+        assert_eq!(
+            metrics.database.node_status_counts.get("COMPLETED"),
+            Some(&1)
+        );
 
         let _ = std::fs::remove_file(db_path);
     }

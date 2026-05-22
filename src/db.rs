@@ -8,17 +8,28 @@ use std::time::Duration;
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const SCHEMA: &[&str] = &[
-    r#"
-    CREATE TABLE IF NOT EXISTS global_tasks (
+pub const LATEST_SCHEMA_VERSION: i64 = 1;
+
+struct Migration {
+    version: i64,
+    name: &'static str,
+    statements: &'static [&'static str],
+}
+
+const MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    name: "initial_state_engine",
+    statements: &[
+        r#"
+    CREATE TABLE global_tasks (
         id TEXT PRIMARY KEY NOT NULL,
         goal TEXT NOT NULL,
         context TEXT NOT NULL CHECK (json_valid(context)),
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
     )
     "#,
-    r#"
-    CREATE TABLE IF NOT EXISTS dag_nodes (
+        r#"
+    CREATE TABLE dag_nodes (
         id TEXT PRIMARY KEY NOT NULL,
         task_id TEXT NOT NULL REFERENCES global_tasks(id) ON DELETE CASCADE,
         status TEXT NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED')),
@@ -33,8 +44,8 @@ pub const SCHEMA: &[&str] = &[
         UNIQUE(task_id, id)
     )
     "#,
-    r#"
-    CREATE TABLE IF NOT EXISTS event_journal (
+        r#"
+    CREATE TABLE event_journal (
         id TEXT PRIMARY KEY NOT NULL,
         task_id TEXT NOT NULL REFERENCES global_tasks(id) ON DELETE CASCADE,
         node_id TEXT NOT NULL REFERENCES dag_nodes(id) ON DELETE CASCADE,
@@ -43,11 +54,12 @@ pub const SCHEMA: &[&str] = &[
         timestamp TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
     )
     "#,
-    "CREATE INDEX IF NOT EXISTS idx_dag_nodes_task_status ON dag_nodes(task_id, status)",
-    "CREATE INDEX IF NOT EXISTS idx_dag_nodes_running_timeout ON dag_nodes(status, acquired_at)",
-    "CREATE INDEX IF NOT EXISTS idx_dag_nodes_lease_timeout ON dag_nodes(status, lease_expires_at)",
-    "CREATE INDEX IF NOT EXISTS idx_event_journal_task_node ON event_journal(task_id, node_id, timestamp)",
-];
+        "CREATE INDEX idx_dag_nodes_task_status ON dag_nodes(task_id, status)",
+        "CREATE INDEX idx_dag_nodes_running_timeout ON dag_nodes(status, acquired_at)",
+        "CREATE INDEX idx_dag_nodes_lease_timeout ON dag_nodes(status, lease_expires_at)",
+        "CREATE INDEX idx_event_journal_task_node ON event_journal(task_id, node_id, timestamp)",
+    ],
+}];
 
 #[derive(Debug, Error)]
 pub enum DbError {
@@ -248,6 +260,18 @@ pub struct LeaseInfo {
     pub lease_expires_at: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DatabaseMetrics {
+    pub schema_version: i64,
+    pub latest_schema_version: i64,
+    pub total_tasks: i64,
+    pub total_nodes: i64,
+    pub total_events: i64,
+    pub running_leases: i64,
+    pub expired_running_leases: i64,
+    pub node_status_counts: BTreeMap<String, i64>,
+}
+
 impl TryFrom<EventJournalRow> for JournalEvent {
     type Error = DbError;
 
@@ -319,10 +343,7 @@ impl Database {
             .execute(&pool)
             .await?;
 
-        for statement in SCHEMA {
-            sqlx::query(statement).execute(&pool).await?;
-        }
-        run_compatibility_migrations(&pool).await?;
+        initialise_schema(&pool).await?;
 
         Ok(Self { pool })
     }
@@ -330,6 +351,56 @@ impl Database {
     pub async fn ping(&self) -> Result<(), DbError> {
         sqlx::query("SELECT 1").execute(&self.pool).await?;
         Ok(())
+    }
+
+    pub async fn schema_version(&self) -> Result<i64, DbError> {
+        schema_version(&self.pool).await
+    }
+
+    pub async fn metrics(&self) -> Result<DatabaseMetrics, DbError> {
+        let schema_version = self.schema_version().await?;
+        let total_tasks = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM global_tasks")
+            .fetch_one(&self.pool)
+            .await?;
+        let total_nodes = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM dag_nodes")
+            .fetch_one(&self.pool)
+            .await?;
+        let total_events = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM event_journal")
+            .fetch_one(&self.pool)
+            .await?;
+        let running_leases = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM dag_nodes WHERE status = 'RUNNING' AND lease_id IS NOT NULL",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let expired_running_leases = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM dag_nodes
+            WHERE status = 'RUNNING'
+              AND lease_expires_at IS NOT NULL
+              AND lease_expires_at <= unixepoch('now')
+            "#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let status_rows = sqlx::query_as::<_, (String, i64)>(
+            "SELECT status, COUNT(*) FROM dag_nodes GROUP BY status",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let node_status_counts = status_rows.into_iter().collect();
+
+        Ok(DatabaseMetrics {
+            schema_version,
+            latest_schema_version: LATEST_SCHEMA_VERSION,
+            total_tasks,
+            total_nodes,
+            total_events,
+            running_leases,
+            expired_running_leases,
+            node_status_counts,
+        })
     }
 
     pub async fn register_task(
@@ -868,10 +939,150 @@ impl Database {
     }
 }
 
-async fn run_compatibility_migrations(pool: &SqlitePool) -> Result<(), DbError> {
+async fn initialise_schema(pool: &SqlitePool) -> Result<(), DbError> {
+    let had_migration_table = table_exists(pool, "agentd_schema_migrations").await?;
+    let had_core_schema = table_exists(pool, "global_tasks").await?
+        || table_exists(pool, "dag_nodes").await?
+        || table_exists(pool, "event_journal").await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS agentd_schema_migrations (
+            version INTEGER PRIMARY KEY NOT NULL,
+            name TEXT NOT NULL,
+            applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    if !had_migration_table && had_core_schema {
+        adopt_legacy_schema(pool).await?;
+    }
+
+    apply_pending_migrations(pool).await?;
+    Ok(())
+}
+
+async fn adopt_legacy_schema(pool: &SqlitePool) -> Result<(), DbError> {
+    for table in ["global_tasks", "dag_nodes", "event_journal"] {
+        if !table_exists(pool, table).await? {
+            return Err(DbError::InvalidState(format!(
+                "cannot adopt legacy database: missing table {table}"
+            )));
+        }
+    }
+
     ensure_column(pool, "dag_nodes", "lease_id", "TEXT").await?;
     ensure_column(pool, "dag_nodes", "lease_owner", "TEXT").await?;
     ensure_column(pool, "dag_nodes", "lease_expires_at", "INTEGER").await?;
+    ensure_index(
+        pool,
+        "idx_dag_nodes_task_status",
+        "CREATE INDEX IF NOT EXISTS idx_dag_nodes_task_status ON dag_nodes(task_id, status)",
+    )
+    .await?;
+    ensure_index(
+        pool,
+        "idx_dag_nodes_running_timeout",
+        "CREATE INDEX IF NOT EXISTS idx_dag_nodes_running_timeout ON dag_nodes(status, acquired_at)",
+    )
+    .await?;
+    ensure_index(
+        pool,
+        "idx_dag_nodes_lease_timeout",
+        "CREATE INDEX IF NOT EXISTS idx_dag_nodes_lease_timeout ON dag_nodes(status, lease_expires_at)",
+    )
+    .await?;
+    ensure_index(
+        pool,
+        "idx_event_journal_task_node",
+        "CREATE INDEX IF NOT EXISTS idx_event_journal_task_node ON event_journal(task_id, node_id, timestamp)",
+    )
+    .await?;
+
+    for migration in MIGRATIONS {
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO agentd_schema_migrations (version, name)
+            VALUES (?, ?)
+            "#,
+        )
+        .bind(migration.version)
+        .bind(migration.name)
+        .execute(pool)
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn apply_pending_migrations(pool: &SqlitePool) -> Result<(), DbError> {
+    let applied_versions = sqlx::query_scalar::<_, i64>(
+        "SELECT version FROM agentd_schema_migrations ORDER BY version ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+    let applied_versions: HashSet<i64> = applied_versions.into_iter().collect();
+
+    for migration in MIGRATIONS {
+        if applied_versions.contains(&migration.version) {
+            continue;
+        }
+
+        let mut tx = pool.begin().await?;
+        for statement in migration.statements {
+            sqlx::query(statement).execute(&mut *tx).await?;
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO agentd_schema_migrations (version, name)
+            VALUES (?, ?)
+            "#,
+        )
+        .bind(migration.version)
+        .bind(migration.name)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+    }
+
+    Ok(())
+}
+
+async fn schema_version(pool: &SqlitePool) -> Result<i64, DbError> {
+    Ok(
+        sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(version) FROM agentd_schema_migrations")
+            .fetch_one(pool)
+            .await?
+            .unwrap_or(0),
+    )
+}
+
+async fn table_exists(pool: &SqlitePool, table_name: &str) -> Result<bool, DbError> {
+    let exists = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+    )
+    .bind(table_name)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(exists == 1)
+}
+
+async fn ensure_index(pool: &SqlitePool, index_name: &str, statement: &str) -> Result<(), DbError> {
+    let exists = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
+    )
+    .bind(index_name)
+    .fetch_one(pool)
+    .await?;
+
+    if exists == 0 {
+        sqlx::query(statement).execute(pool).await?;
+    }
+
     Ok(())
 }
 
@@ -975,4 +1186,132 @@ fn visit_node(
     temporary.remove(&node_id);
     permanent.insert(node_id);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fresh_database_applies_latest_schema_version() {
+        let db_path = test_db_path();
+        let database_url = format!("sqlite://{}", db_path.display());
+        let db = Database::initialise(&database_url)
+            .await
+            .expect("database should initialise");
+
+        assert_eq!(db.schema_version().await.unwrap(), LATEST_SCHEMA_VERSION);
+        assert!(table_exists(&db.pool, "agentd_schema_migrations")
+            .await
+            .unwrap());
+
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn legacy_database_is_adopted_without_losing_state() {
+        let db_path = test_db_path();
+        let database_url = format!("sqlite://{}", db_path.display());
+        create_legacy_database(&database_url).await;
+
+        let db = Database::initialise(&database_url)
+            .await
+            .expect("legacy database should initialise");
+        let columns = table_columns(&db.pool, "dag_nodes").await.unwrap();
+
+        assert_eq!(db.schema_version().await.unwrap(), LATEST_SCHEMA_VERSION);
+        assert!(columns.iter().any(|column| column == "lease_id"));
+        assert!(columns.iter().any(|column| column == "lease_owner"));
+        assert!(columns.iter().any(|column| column == "lease_expires_at"));
+
+        let metrics = db.metrics().await.expect("metrics should load");
+        assert_eq!(metrics.total_tasks, 1);
+        assert_eq!(metrics.total_nodes, 1);
+
+        cleanup_db(&db_path);
+    }
+
+    async fn create_legacy_database(database_url: &str) {
+        let options = SqliteConnectOptions::from_str(database_url)
+            .unwrap()
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+
+        for statement in [
+            r#"
+            CREATE TABLE global_tasks (
+                id TEXT PRIMARY KEY NOT NULL,
+                goal TEXT NOT NULL,
+                context TEXT NOT NULL CHECK (json_valid(context)),
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            )
+            "#,
+            r#"
+            CREATE TABLE dag_nodes (
+                id TEXT PRIMARY KEY NOT NULL,
+                task_id TEXT NOT NULL REFERENCES global_tasks(id) ON DELETE CASCADE,
+                status TEXT NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED')),
+                dependencies TEXT NOT NULL CHECK (json_valid(dependencies) AND json_type(dependencies) = 'array'),
+                payload_schema TEXT NOT NULL CHECK (json_valid(payload_schema)),
+                result_payload TEXT CHECK (result_payload IS NULL OR json_valid(result_payload)),
+                acquired_at INTEGER,
+                updated_at INTEGER NOT NULL DEFAULT (unixepoch('now')),
+                UNIQUE(task_id, id)
+            )
+            "#,
+            r#"
+            CREATE TABLE event_journal (
+                id TEXT PRIMARY KEY NOT NULL,
+                task_id TEXT NOT NULL REFERENCES global_tasks(id) ON DELETE CASCADE,
+                node_id TEXT NOT NULL REFERENCES dag_nodes(id) ON DELETE CASCADE,
+                action_type TEXT NOT NULL,
+                payload TEXT NOT NULL CHECK (json_valid(payload)),
+                timestamp TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            )
+            "#,
+        ] {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
+
+        let task_id = Uuid::new_v4();
+        let node_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO global_tasks (id, goal, context) VALUES (?, ?, ?)")
+            .bind(task_id.to_string())
+            .bind("legacy task")
+            .bind("{}")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO dag_nodes (id, task_id, status, dependencies, payload_schema) VALUES (?, ?, 'PENDING', '[]', '{}')",
+        )
+        .bind(node_id.to_string())
+        .bind(task_id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+    }
+
+    async fn table_columns(pool: &SqlitePool, table_name: &str) -> Result<Vec<String>, DbError> {
+        let query = format!("SELECT name FROM pragma_table_info('{table_name}')");
+        Ok(sqlx::query_scalar::<_, String>(&query)
+            .fetch_all(pool)
+            .await?)
+    }
+
+    fn test_db_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("agentd_db_test_{}.db", Uuid::new_v4()))
+    }
+
+    fn cleanup_db(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
 }
