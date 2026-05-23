@@ -62,6 +62,11 @@ async fn ipc_contract_supports_multi_worker_dag_flow() {
         .expect("methods should be an array")
         .iter()
         .any(|method| method["method"] == "Metrics"));
+    assert!(interface["methods"]
+        .as_array()
+        .expect("methods should be an array")
+        .iter()
+        .any(|method| method["method"] == "AcquireResourceLock"));
 
     let first_node = Uuid::new_v4();
     let second_node = Uuid::new_v4();
@@ -120,7 +125,7 @@ async fn ipc_contract_supports_multi_worker_dag_flow() {
     complete(&daemon.socket_path, task_id, &joined).await;
 
     let metrics = rpc_call(&daemon.socket_path, "Metrics", json!({})).await;
-    assert_eq!(metrics["database"]["schema_version"], 1);
+    assert_eq!(metrics["database"]["schema_version"], 2);
     assert_eq!(metrics["database"]["total_tasks"], 1);
     assert_eq!(metrics["database"]["total_nodes"], 3);
     assert_eq!(metrics["runtime"]["completed_nodes"], 3);
@@ -206,6 +211,81 @@ async fn ipc_rejects_oversized_request_line() {
         .expect("response should read");
     let response: Value = serde_json::from_str(&line).expect("response should be JSON");
     assert_eq!(response["error"]["code"], -32001);
+}
+
+#[tokio::test]
+async fn ipc_resource_locks_coordinate_cross_provider_file_edits() {
+    let daemon = TestDaemon::start(Duration::from_secs(30)).await;
+
+    let first = rpc_call(
+        &daemon.socket_path,
+        "AcquireResourceLock",
+        json!({
+            "resource_key": "file:src/lib.rs",
+            "owner": "codex-cli",
+            "provider": "openai",
+            "ttl_secs": 30,
+            "metadata": {"intent": "edit"}
+        }),
+    )
+    .await;
+    assert_eq!(first["resource_key"], "file:src/lib.rs");
+    assert_eq!(first["owner"], "codex-cli");
+    assert_eq!(first["provider"], "openai");
+
+    let blocked = rpc_call(
+        &daemon.socket_path,
+        "AcquireResourceLock",
+        json!({
+            "resource_key": "file:src/lib.rs",
+            "owner": "claude-code",
+            "provider": "anthropic",
+            "ttl_secs": 30
+        }),
+    )
+    .await;
+    assert!(blocked.is_null());
+
+    rpc_call(
+        &daemon.socket_path,
+        "HeartbeatResourceLock",
+        json!({
+            "resource_key": "file:src/lib.rs",
+            "lease_id": first["lease_id"],
+            "ttl_secs": 30
+        }),
+    )
+    .await;
+
+    let locks = rpc_call(&daemon.socket_path, "ListResourceLocks", json!({})).await;
+    assert_eq!(
+        locks["locks"].as_array().expect("locks should array").len(),
+        1
+    );
+
+    rpc_call(
+        &daemon.socket_path,
+        "ReleaseResourceLock",
+        json!({
+            "resource_key": "file:src/lib.rs",
+            "lease_id": first["lease_id"]
+        }),
+    )
+    .await;
+
+    let second = rpc_call(
+        &daemon.socket_path,
+        "AcquireResourceLock",
+        json!({
+            "resource_key": "file:src/lib.rs",
+            "owner": "claude-code",
+            "provider": "anthropic",
+            "ttl_secs": 30
+        }),
+    )
+    .await;
+    assert_eq!(second["owner"], "claude-code");
+    assert_ne!(second["lease_id"], first["lease_id"]);
 }
 
 async fn complete(socket_path: &Path, task_id: &str, acquired: &Value) {

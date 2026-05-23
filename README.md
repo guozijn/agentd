@@ -7,6 +7,7 @@
 - Durable SQLite state under `~/.agentd`
 - Strict DAG node states: `PENDING`, `RUNNING`, `COMPLETED`, `FAILED`
 - Lease-based node acquisition with heartbeat and timeout rollback
+- Cross-provider resource locks for repository files and other shared resources
 - Append-only event journal
 - Runtime interface discovery: `DescribeInterface`
 - Health and metrics endpoints: `Health`, `Metrics`
@@ -112,6 +113,10 @@ Supported methods:
 | `CompleteNode` | Complete a leased node |
 | `FailNode` | Fail a leased node |
 | `TaskStatus` | Return task and node state |
+| `AcquireResourceLock` | Lease a named resource such as `file:src/lib.rs` |
+| `HeartbeatResourceLock` | Extend a resource lock lease |
+| `ReleaseResourceLock` | Release a resource lock lease |
+| `ListResourceLocks` | Return active resource locks |
 
 Agents should call `DescribeInterface` when they do not have a generated or built-in client.
 
@@ -132,6 +137,52 @@ printf '%s\n' '{"id":1,"method":"DescribeInterface","params":{}}' | nc -U ~/.age
 - synthesised execution context
 
 Workers must pass the current `lease_id` to `CommitEvent`, `HeartbeatNode`, `CompleteNode`, and `FailNode`. If a worker stalls past `AGENTD_NODE_TIMEOUT_SECS`, the daemon rolls the node back to `PENDING`; a later worker gets a new lease, and stale lease writes are rejected.
+
+## Cross-provider Repository Locks
+
+Agents from different providers can collaborate in one repository by using `agentd` as the local coordination point. Before editing a file or other shared resource, acquire an exclusive resource lock with a stable `resource_key`.
+
+Recommended key formats:
+
+| Resource | Key example |
+| --- | --- |
+| Single file | `file:src/lib.rs` |
+| Directory-wide operation | `dir:src` |
+| Generated artifact | `artifact:docs/api.json` |
+| External tool | `tool:cargo-fmt` |
+
+Acquire a file lock:
+
+```bash
+printf '%s\n' '{
+  "id": 1,
+  "method": "AcquireResourceLock",
+  "params": {
+    "resource_key": "file:src/lib.rs",
+    "owner": "codex-cli",
+    "provider": "openai",
+    "ttl_secs": 300,
+    "metadata": {"intent": "edit"}
+  }
+}' | nc -U ~/.agentd/agentd.sock | python3 -m json.tool
+```
+
+If the resource is already held, the result is `null`. If the lock is granted, the result includes a `lease_id`. The agent must pass that `lease_id` to `HeartbeatResourceLock` while working and to `ReleaseResourceLock` when finished.
+
+Release a file lock:
+
+```bash
+printf '%s\n' '{
+  "id": 2,
+  "method": "ReleaseResourceLock",
+  "params": {
+    "resource_key": "file:src/lib.rs",
+    "lease_id": "current-lease-uuid"
+  }
+}' | nc -U ~/.agentd/agentd.sock | python3 -m json.tool
+```
+
+This is provider-agnostic: Codex, Claude Code, DeepSeek scripts, local shell agents, or custom clients all use the same Unix socket and SQLite-backed lease table. Expired locks are recoverable; a later agent can acquire the same `resource_key` after the previous lease times out.
 
 ## Smoke Tests
 

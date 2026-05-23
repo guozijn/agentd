@@ -28,7 +28,7 @@
         <h1>agentd</h1>
         <p class="lede">
           An out-of-process state machine daemon for AI agents. It owns durable task state,
-          strict DAG transitions, leases, heartbeats, and an append-only event journal.
+          strict DAG transitions, file locks, heartbeats, and an append-only event journal.
         </p>
         <div class="hero-actions">
           <a class="button" href="https://github.com/guozijn/agentd">View source</a>
@@ -57,6 +57,11 @@
               <div class="feature-mark"></div>
               <h3>Lease safety</h3>
               <p>Workers acquire leases, heartbeat while running, and stale work rolls back to <code>PENDING</code>.</p>
+            </article>
+            <article class="feature">
+              <div class="feature-mark"></div>
+              <h3>Repository locks</h3>
+              <p>Agents from different providers can lease resource keys such as <code>file:src/lib.rs</code> before editing.</p>
             </article>
             <article class="feature">
               <div class="feature-mark"></div>
@@ -95,6 +100,10 @@
               <div class="method">CompleteNode</div>
               <div class="method">FailNode</div>
               <div class="method">TaskStatus</div>
+              <div class="method">AcquireResourceLock</div>
+              <div class="method">HeartbeatResourceLock</div>
+              <div class="method">ReleaseResourceLock</div>
+              <div class="method">ListResourceLocks</div>
             </div>
           </div>
           <pre class="terminal"><code>printf '%s\n' '{"id":1,"method":"DescribeInterface","params":{}}' \

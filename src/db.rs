@@ -8,7 +8,7 @@ use std::time::Duration;
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const LATEST_SCHEMA_VERSION: i64 = 1;
+pub const LATEST_SCHEMA_VERSION: i64 = 2;
 
 struct Migration {
     version: i64,
@@ -16,11 +16,12 @@ struct Migration {
     statements: &'static [&'static str],
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial_state_engine",
-    statements: &[
-        r#"
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial_state_engine",
+        statements: &[
+            r#"
     CREATE TABLE global_tasks (
         id TEXT PRIMARY KEY NOT NULL,
         goal TEXT NOT NULL,
@@ -54,12 +55,35 @@ const MIGRATIONS: &[Migration] = &[Migration {
         timestamp TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
     )
     "#,
-        "CREATE INDEX idx_dag_nodes_task_status ON dag_nodes(task_id, status)",
-        "CREATE INDEX idx_dag_nodes_running_timeout ON dag_nodes(status, acquired_at)",
-        "CREATE INDEX idx_dag_nodes_lease_timeout ON dag_nodes(status, lease_expires_at)",
-        "CREATE INDEX idx_event_journal_task_node ON event_journal(task_id, node_id, timestamp)",
-    ],
-}];
+            "CREATE INDEX idx_dag_nodes_task_status ON dag_nodes(task_id, status)",
+            "CREATE INDEX idx_dag_nodes_running_timeout ON dag_nodes(status, acquired_at)",
+            "CREATE INDEX idx_dag_nodes_lease_timeout ON dag_nodes(status, lease_expires_at)",
+            "CREATE INDEX idx_event_journal_task_node ON event_journal(task_id, node_id, timestamp)",
+        ],
+    },
+    Migration {
+        version: 2,
+        name: "resource_locks",
+        statements: &[
+            r#"
+    CREATE TABLE resource_locks (
+        resource_key TEXT PRIMARY KEY NOT NULL,
+        lease_id TEXT NOT NULL,
+        owner TEXT NOT NULL,
+        provider TEXT,
+        task_id TEXT REFERENCES global_tasks(id) ON DELETE CASCADE,
+        node_id TEXT,
+        metadata TEXT NOT NULL CHECK (json_valid(metadata)),
+        acquired_at INTEGER NOT NULL DEFAULT (unixepoch('now')),
+        lease_expires_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL DEFAULT (unixepoch('now'))
+    )
+    "#,
+            "CREATE INDEX idx_resource_locks_lease_timeout ON resource_locks(lease_expires_at)",
+            "CREATE INDEX idx_resource_locks_owner ON resource_locks(owner)",
+        ],
+    },
+];
 
 #[derive(Debug, Error)]
 pub enum DbError {
@@ -267,9 +291,101 @@ pub struct DatabaseMetrics {
     pub total_tasks: i64,
     pub total_nodes: i64,
     pub total_events: i64,
+    pub active_resource_locks: i64,
+    pub expired_resource_locks: i64,
     pub running_leases: i64,
     pub expired_running_leases: i64,
     pub node_status_counts: BTreeMap<String, i64>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct ResourceLockRow {
+    pub resource_key: String,
+    pub lease_id: String,
+    pub owner: String,
+    pub provider: Option<String>,
+    pub task_id: Option<String>,
+    pub node_id: Option<String>,
+    pub metadata: String,
+    pub acquired_at: i64,
+    pub lease_expires_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResourceLockSnapshot {
+    pub resource_key: String,
+    pub lease_id: Uuid,
+    pub owner: String,
+    pub provider: Option<String>,
+    pub task_id: Option<Uuid>,
+    pub node_id: Option<Uuid>,
+    pub metadata: Value,
+    pub acquired_at: i64,
+    pub lease_expires_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResourceLockLease {
+    pub resource_key: String,
+    pub lease_id: Uuid,
+    pub owner: String,
+    pub provider: Option<String>,
+    pub task_id: Option<Uuid>,
+    pub node_id: Option<Uuid>,
+    pub metadata: Value,
+    pub acquired_at: i64,
+    pub lease_expires_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct AcquireResourceLock {
+    pub resource_key: String,
+    pub owner: String,
+    pub provider: Option<String>,
+    pub lease_ttl: Duration,
+    pub task_id: Option<Uuid>,
+    pub node_id: Option<Uuid>,
+    pub metadata: Value,
+}
+
+impl TryFrom<ResourceLockRow> for ResourceLockSnapshot {
+    type Error = DbError;
+
+    fn try_from(row: ResourceLockRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            resource_key: row.resource_key,
+            lease_id: Uuid::parse_str(&row.lease_id)?,
+            owner: row.owner,
+            provider: row.provider,
+            task_id: row.task_id.as_deref().map(Uuid::parse_str).transpose()?,
+            node_id: row.node_id.as_deref().map(Uuid::parse_str).transpose()?,
+            metadata: serde_json::from_str(&row.metadata)?,
+            acquired_at: row.acquired_at,
+            lease_expires_at: row.lease_expires_at,
+            updated_at: row.updated_at,
+        })
+    }
+}
+
+impl TryFrom<ResourceLockRow> for ResourceLockLease {
+    type Error = DbError;
+
+    fn try_from(row: ResourceLockRow) -> Result<Self, Self::Error> {
+        let snapshot = ResourceLockSnapshot::try_from(row)?;
+        Ok(Self {
+            resource_key: snapshot.resource_key,
+            lease_id: snapshot.lease_id,
+            owner: snapshot.owner,
+            provider: snapshot.provider,
+            task_id: snapshot.task_id,
+            node_id: snapshot.node_id,
+            metadata: snapshot.metadata,
+            acquired_at: snapshot.acquired_at,
+            lease_expires_at: snapshot.lease_expires_at,
+        })
+    }
 }
 
 impl TryFrom<EventJournalRow> for JournalEvent {
@@ -368,6 +484,16 @@ impl Database {
         let total_events = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM event_journal")
             .fetch_one(&self.pool)
             .await?;
+        let active_resource_locks = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM resource_locks WHERE lease_expires_at > unixepoch('now')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let expired_resource_locks = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM resource_locks WHERE lease_expires_at <= unixepoch('now')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
         let running_leases = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM dag_nodes WHERE status = 'RUNNING' AND lease_id IS NOT NULL",
         )
@@ -397,6 +523,8 @@ impl Database {
             total_tasks,
             total_nodes,
             total_events,
+            active_resource_locks,
+            expired_resource_locks,
             running_leases,
             expired_running_leases,
             node_status_counts,
@@ -829,6 +957,147 @@ impl Database {
         Ok(result.rows_affected())
     }
 
+    pub async fn acquire_resource_lock(
+        &self,
+        request: AcquireResourceLock,
+    ) -> Result<Option<ResourceLockLease>, DbError> {
+        let lease_id = Uuid::new_v4();
+        let lease_ttl_secs = i64::try_from(request.lease_ttl.as_secs())
+            .unwrap_or(i64::MAX)
+            .max(1);
+        let metadata_json = serde_json::to_string(&request.metadata)?;
+        let task_id_string = request.task_id.map(|id| id.to_string());
+        let node_id_string = request.node_id.map(|id| id.to_string());
+
+        let mut tx = self.pool.begin().await?;
+        let update = sqlx::query(
+            r#"
+            UPDATE resource_locks
+            SET lease_id = ?,
+                owner = ?,
+                provider = ?,
+                task_id = ?,
+                node_id = ?,
+                metadata = ?,
+                acquired_at = unixepoch('now'),
+                lease_expires_at = unixepoch('now') + ?,
+                updated_at = unixepoch('now')
+            WHERE resource_key = ? AND lease_expires_at <= unixepoch('now')
+            "#,
+        )
+        .bind(lease_id.to_string())
+        .bind(&request.owner)
+        .bind(request.provider.as_deref())
+        .bind(task_id_string.as_deref())
+        .bind(node_id_string.as_deref())
+        .bind(&metadata_json)
+        .bind(lease_ttl_secs)
+        .bind(&request.resource_key)
+        .execute(&mut *tx)
+        .await?;
+
+        if update.rows_affected() == 0 {
+            sqlx::query(
+                r#"
+                INSERT OR IGNORE INTO resource_locks (
+                    resource_key, lease_id, owner, provider, task_id, node_id, metadata,
+                    acquired_at, lease_expires_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, unixepoch('now'), unixepoch('now') + ?, unixepoch('now'))
+                "#,
+            )
+            .bind(&request.resource_key)
+            .bind(lease_id.to_string())
+            .bind(&request.owner)
+            .bind(request.provider.as_deref())
+            .bind(task_id_string.as_deref())
+            .bind(node_id_string.as_deref())
+            .bind(&metadata_json)
+            .bind(lease_ttl_secs)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let row = sqlx::query_as::<_, ResourceLockRow>(
+            r#"
+            SELECT resource_key, lease_id, owner, provider, task_id, node_id, metadata,
+                   acquired_at, lease_expires_at, updated_at
+            FROM resource_locks
+            WHERE resource_key = ?
+            "#,
+        )
+        .bind(&request.resource_key)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        if row.lease_id == lease_id.to_string() {
+            Ok(Some(ResourceLockLease::try_from(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn heartbeat_resource_lock(
+        &self,
+        resource_key: &str,
+        lease_id: Uuid,
+        lease_ttl: Duration,
+    ) -> Result<bool, DbError> {
+        let lease_ttl_secs = i64::try_from(lease_ttl.as_secs())
+            .unwrap_or(i64::MAX)
+            .max(1);
+        let result = sqlx::query(
+            r#"
+            UPDATE resource_locks
+            SET lease_expires_at = unixepoch('now') + ?,
+                updated_at = unixepoch('now')
+            WHERE resource_key = ? AND lease_id = ? AND lease_expires_at > unixepoch('now')
+            "#,
+        )
+        .bind(lease_ttl_secs)
+        .bind(resource_key)
+        .bind(lease_id.to_string())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn release_resource_lock(
+        &self,
+        resource_key: &str,
+        lease_id: Uuid,
+    ) -> Result<bool, DbError> {
+        let result =
+            sqlx::query("DELETE FROM resource_locks WHERE resource_key = ? AND lease_id = ?")
+                .bind(resource_key)
+                .bind(lease_id.to_string())
+                .execute(&self.pool)
+                .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn list_resource_locks(&self) -> Result<Vec<ResourceLockSnapshot>, DbError> {
+        let rows = sqlx::query_as::<_, ResourceLockRow>(
+            r#"
+            SELECT resource_key, lease_id, owner, provider, task_id, node_id, metadata,
+                   acquired_at, lease_expires_at, updated_at
+            FROM resource_locks
+            WHERE lease_expires_at > unixepoch('now')
+            ORDER BY resource_key ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(ResourceLockSnapshot::try_from)
+            .collect()
+    }
+
     pub async fn dependency_results(
         &self,
         task_id: Uuid,
@@ -1002,18 +1271,14 @@ async fn adopt_legacy_schema(pool: &SqlitePool) -> Result<(), DbError> {
     )
     .await?;
 
-    for migration in MIGRATIONS {
-        sqlx::query(
-            r#"
-            INSERT OR IGNORE INTO agentd_schema_migrations (version, name)
-            VALUES (?, ?)
-            "#,
-        )
-        .bind(migration.version)
-        .bind(migration.name)
-        .execute(pool)
-        .await?;
-    }
+    sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO agentd_schema_migrations (version, name)
+        VALUES (1, 'initial_state_engine')
+        "#,
+    )
+    .execute(pool)
+    .await?;
 
     Ok(())
 }
@@ -1223,6 +1488,7 @@ mod tests {
         assert!(columns.iter().any(|column| column == "lease_id"));
         assert!(columns.iter().any(|column| column == "lease_owner"));
         assert!(columns.iter().any(|column| column == "lease_expires_at"));
+        assert!(table_exists(&db.pool, "resource_locks").await.unwrap());
 
         let metrics = db.metrics().await.expect("metrics should load");
         assert_eq!(metrics.total_tasks, 1);

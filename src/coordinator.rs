@@ -1,4 +1,7 @@
-use crate::db::{DagNodeRow, Database, DatabaseMetrics, DbError, NodeDefinition, TaskSnapshot};
+use crate::db::{
+    AcquireResourceLock, DagNodeRow, Database, DatabaseMetrics, DbError, NodeDefinition,
+    ResourceLockLease, ResourceLockSnapshot, TaskSnapshot,
+};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -58,6 +61,8 @@ struct RuntimeMetrics {
     completed_nodes: AtomicU64,
     failed_nodes: AtomicU64,
     timeout_rollbacks: AtomicU64,
+    acquired_resource_locks: AtomicU64,
+    released_resource_locks: AtomicU64,
 }
 
 #[derive(Debug, Serialize)]
@@ -81,6 +86,19 @@ pub struct RuntimeMetricsSnapshot {
     pub completed_nodes: u64,
     pub failed_nodes: u64,
     pub timeout_rollbacks: u64,
+    pub acquired_resource_locks: u64,
+    pub released_resource_locks: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResourceLockRequest {
+    pub resource_key: String,
+    pub owner: String,
+    pub provider: Option<String>,
+    pub ttl: Option<Duration>,
+    pub task_id: Option<Uuid>,
+    pub node_id: Option<Uuid>,
+    pub metadata: Value,
 }
 
 impl Coordinator {
@@ -250,6 +268,78 @@ impl Coordinator {
         Ok(count)
     }
 
+    pub async fn acquire_resource_lock(
+        &self,
+        request: ResourceLockRequest,
+    ) -> Result<Option<ResourceLockLease>, CoordinatorError> {
+        let lease_ttl = request.ttl.unwrap_or(self.running_timeout);
+        let acquired = self
+            .db
+            .acquire_resource_lock(AcquireResourceLock {
+                resource_key: request.resource_key,
+                owner: request.owner,
+                provider: request.provider,
+                lease_ttl,
+                task_id: request.task_id,
+                node_id: request.node_id,
+                metadata: request.metadata,
+            })
+            .await?;
+
+        if acquired.is_some() {
+            self.metrics
+                .acquired_resource_locks
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        Ok(acquired)
+    }
+
+    pub async fn heartbeat_resource_lock(
+        &self,
+        resource_key: String,
+        lease_id: Uuid,
+        ttl: Option<Duration>,
+    ) -> Result<(), CoordinatorError> {
+        let lease_ttl = ttl.unwrap_or(self.running_timeout);
+        if self
+            .db
+            .heartbeat_resource_lock(&resource_key, lease_id, lease_ttl)
+            .await?
+        {
+            Ok(())
+        } else {
+            Err(CoordinatorError::Db(DbError::InvalidState(format!(
+                "resource lock {resource_key} requires the current active lease"
+            ))))
+        }
+    }
+
+    pub async fn release_resource_lock(
+        &self,
+        resource_key: String,
+        lease_id: Uuid,
+    ) -> Result<(), CoordinatorError> {
+        if self
+            .db
+            .release_resource_lock(&resource_key, lease_id)
+            .await?
+        {
+            self.metrics
+                .released_resource_locks
+                .fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        } else {
+            Err(CoordinatorError::Db(DbError::InvalidState(format!(
+                "resource lock {resource_key} requires the current lease"
+            ))))
+        }
+    }
+
+    pub async fn list_resource_locks(&self) -> Result<Vec<ResourceLockSnapshot>, CoordinatorError> {
+        Ok(self.db.list_resource_locks().await?)
+    }
+
     pub async fn health(&self) -> Result<HealthStatus, CoordinatorError> {
         self.db.ping().await?;
         Ok(HealthStatus {
@@ -298,6 +388,8 @@ impl Coordinator {
             completed_nodes: self.metrics.completed_nodes.load(Ordering::Relaxed),
             failed_nodes: self.metrics.failed_nodes.load(Ordering::Relaxed),
             timeout_rollbacks: self.metrics.timeout_rollbacks.load(Ordering::Relaxed),
+            acquired_resource_locks: self.metrics.acquired_resource_locks.load(Ordering::Relaxed),
+            released_resource_locks: self.metrics.released_resource_locks.load(Ordering::Relaxed),
         }
     }
 
@@ -402,6 +494,24 @@ mod tests {
             dependencies: Vec::new(),
             payload_schema: json!({ "type": "object" }),
         }]
+    }
+
+    fn lock_request(
+        resource_key: &str,
+        owner: &str,
+        provider: &str,
+        ttl: Option<Duration>,
+        metadata: Value,
+    ) -> ResourceLockRequest {
+        ResourceLockRequest {
+            resource_key: resource_key.to_string(),
+            owner: owner.to_string(),
+            provider: Some(provider.to_string()),
+            ttl,
+            task_id: None,
+            node_id: None,
+            metadata,
+        }
     }
 
     #[tokio::test]
@@ -536,6 +646,96 @@ mod tests {
             metrics.database.node_status_counts.get("COMPLETED"),
             Some(&1)
         );
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn resource_locks_are_exclusive_until_release_or_timeout() {
+        let (coordinator, db_path) = test_coordinator(Duration::from_secs(60)).await;
+
+        let first = coordinator
+            .acquire_resource_lock(lock_request(
+                "file:src/lib.rs",
+                "codex",
+                "openai",
+                None,
+                json!({ "purpose": "edit" }),
+            ))
+            .await
+            .expect("lock acquire should not error")
+            .expect("first lock should acquire");
+
+        let blocked = coordinator
+            .acquire_resource_lock(lock_request(
+                "file:src/lib.rs",
+                "claude",
+                "anthropic",
+                None,
+                json!({}),
+            ))
+            .await
+            .expect("blocked acquire should not error");
+        assert!(blocked.is_none());
+
+        coordinator
+            .release_resource_lock("file:src/lib.rs".to_string(), first.lease_id)
+            .await
+            .expect("current lease should release");
+
+        let second = coordinator
+            .acquire_resource_lock(lock_request(
+                "file:src/lib.rs",
+                "claude",
+                "anthropic",
+                None,
+                json!({}),
+            ))
+            .await
+            .expect("second acquire should not error")
+            .expect("lock should be available after release");
+        assert_eq!(second.owner, "claude");
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn expired_resource_lock_can_be_stolen() {
+        let (coordinator, db_path) = test_coordinator(Duration::from_secs(60)).await;
+
+        let first = coordinator
+            .acquire_resource_lock(lock_request(
+                "file:README.md",
+                "stalled",
+                "provider-a",
+                Some(Duration::from_secs(1)),
+                json!({}),
+            ))
+            .await
+            .expect("first acquire should not error")
+            .expect("first lock should acquire");
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let second = coordinator
+            .acquire_resource_lock(lock_request(
+                "file:README.md",
+                "recovery",
+                "provider-b",
+                Some(Duration::from_secs(60)),
+                json!({}),
+            ))
+            .await
+            .expect("second acquire should not error")
+            .expect("expired lock should be acquirable");
+
+        assert_ne!(first.lease_id, second.lease_id);
+        assert_eq!(second.owner, "recovery");
+
+        let stale_release = coordinator
+            .release_resource_lock("file:README.md".to_string(), first.lease_id)
+            .await;
+        assert!(stale_release.is_err());
 
         let _ = std::fs::remove_file(db_path);
     }
