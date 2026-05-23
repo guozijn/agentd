@@ -9,6 +9,7 @@
 - Lease-based node acquisition with heartbeat and timeout rollback
 - Cross-provider resource locks for repository files and other shared resources
 - Append-only event journal
+- Provider-neutral conflict resolution with lock metadata, event history, and patch bundles
 - Runtime interface discovery: `DescribeInterface`
 - Health and metrics endpoints: `Health`, `Metrics`
 - Versioned schema migrations
@@ -183,6 +184,112 @@ printf '%s\n' '{
 ```
 
 This is provider-agnostic: Codex, Claude Code, DeepSeek scripts, local shell agents, or custom clients all use the same Unix socket and SQLite-backed lease table. Expired locks are recoverable; a later agent can acquire the same `resource_key` after the previous lease times out.
+
+## Multi-provider Conflict Resolution
+
+Use `agentd` as the local coordination layer when multiple providers can edit the same repository, for example two Codex workers and an Antigravity-style agent working on `docs/index.html`.
+
+The default policy is:
+
+- Prevent high-risk overlap with narrow `AcquireResourceLock` leases.
+- Put provider-neutral patch metadata in lock `metadata`: base revision, touched paths, diff summary, assumptions, confidence, and planned verification.
+- When work runs inside an agentd task, append `CommitEvent` entries for `intent`, `progress`, `result`, and `conflict`.
+- If providers overlap, compare base revision, touched paths, intent, confidence, and verification output.
+- Merge compatible edits, reject stale or unverifiable edits, and record the accepted decision.
+- Do not use last-writer-wins as the merge policy.
+
+Real scenario: Codex starts a docs edit and Antigravity attempts the same file.
+
+Codex acquires the file lock with patch-bundle metadata:
+
+```bash
+printf '%s\n' '{
+  "id": 10,
+  "method": "AcquireResourceLock",
+  "params": {
+    "resource_key": "file:docs/index.html",
+    "owner": "codex-docs-agent-a",
+    "provider": "openai",
+    "ttl_secs": 600,
+    "metadata": {
+      "intent": "add multi-provider conflict resolution docs",
+      "base_revision": "git:HEAD",
+      "touched_paths": ["docs/index.html", "docs/styles.css", "README.md"],
+      "diff_summary": "document provider-neutral conflict policy and add animated flow",
+      "assumptions": ["static HTML site", "CSS-only animation"],
+      "confidence": "medium",
+      "verification": ["python3 HTML parser sanity check"]
+    }
+  }
+}' | nc -U ~/.agentd/agentd.sock | python3 -m json.tool
+```
+
+If Antigravity tries to acquire the same file while Codex holds it, it receives `null`:
+
+```bash
+printf '%s\n' '{
+  "id": 11,
+  "method": "AcquireResourceLock",
+  "params": {
+    "resource_key": "file:docs/index.html",
+    "owner": "antigravity-docs-agent",
+    "provider": "antigravity",
+    "ttl_secs": 600,
+    "metadata": {
+      "intent": "rewrite docs conflict section",
+      "base_revision": "git:HEAD",
+      "touched_paths": ["docs/index.html"],
+      "diff_summary": "replace conflict section with provider workflow",
+      "confidence": "medium"
+    }
+  }
+}' | nc -U ~/.agentd/agentd.sock | python3 -m json.tool
+```
+
+The coordinator should then choose one of these paths:
+
+| Situation | Coordinator action |
+| --- | --- |
+| Same file, incompatible intent | Keep the first lock, ask the second provider to wait or narrow scope |
+| Same file, compatible intent | Let the second provider produce a patch bundle without writing, then merge manually |
+| Stale base revision | Ask the stale provider to rebase before integration |
+| Failed verification | Reject that provider result and record the reason |
+
+When the work is part of a registered DAG node, record the provider trail with `CommitEvent`:
+
+```bash
+printf '%s\n' '{
+  "id": 12,
+  "method": "CommitEvent",
+  "params": {
+    "task_id": "current-task-uuid",
+    "node_id": "current-node-uuid",
+    "lease_id": "current-node-lease-uuid",
+    "action_type": "conflict",
+    "payload": {
+      "resource_key": "file:docs/index.html",
+      "providers": ["openai", "antigravity"],
+      "resolution": "merged Codex lock-first metadata with Antigravity patch-bundle proposal",
+      "accepted_paths": ["docs/index.html", "docs/styles.css", "README.md"],
+      "rejected_alternatives": ["last-writer-wins"],
+      "verification": "HTML parser sanity check passed"
+    }
+  }
+}' | nc -U ~/.agentd/agentd.sock | python3 -m json.tool
+```
+
+After verification, release the file lock:
+
+```bash
+printf '%s\n' '{
+  "id": 13,
+  "method": "ReleaseResourceLock",
+  "params": {
+    "resource_key": "file:docs/index.html",
+    "lease_id": "current-resource-lock-lease-uuid"
+  }
+}' | nc -U ~/.agentd/agentd.sock | python3 -m json.tool
+```
 
 ## Smoke Tests
 

@@ -17,6 +17,7 @@
       <a class="brand" href="/">agentd.cc</a>
       <nav aria-label="Sections">
         <a href="#runtime">Runtime</a>
+        <a href="#conflicts">Conflicts</a>
         <a href="#interface">Interface</a>
         <a href="https://github.com/guozijn/agentd">GitHub</a>
       </nav>
@@ -65,6 +66,11 @@
             </article>
             <article class="feature">
               <div class="feature-mark"></div>
+              <h3>Conflict resolution</h3>
+              <p>Overlapping Codex, Antigravity, or custom-agent edits can be compared as patch bundles instead of last writer wins.</p>
+            </article>
+            <article class="feature">
+              <div class="feature-mark"></div>
               <h3>Model agnostic</h3>
               <p>Python, Node, Rust, and shell clients can coordinate through Unix Domain Socket JSON Lines IPC.</p>
             </article>
@@ -78,6 +84,57 @@
               <h3>Runtime discovery</h3>
               <p>Agents can call <code>DescribeInterface</code> to learn supported methods and payload shapes.</p>
             </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="conflicts" class="conflict-section">
+        <div class="section-inner split">
+          <div class="copy">
+            <p class="section-kicker">Conflict resolution</p>
+            <h2>Make concurrent agent edits inspectable before they merge.</h2>
+            <p>
+              agentd gives coordinators a provider-neutral handoff for Codex, Antigravity,
+              DeepSeek scripts, and custom agents: resource locks, journaled intent, and patch
+              bundles that can be compared before integration.
+            </p>
+          </div>
+          <div class="conflict-panel" aria-label="Multi-provider conflict resolution flow">
+            <div class="provider-row" aria-label="Provider proposals">
+              <div class="provider-card">
+                <span>Codex A</span>
+                <strong>Lock first</strong>
+              </div>
+              <div class="provider-card">
+                <span>Codex B</span>
+                <strong>Journal first</strong>
+              </div>
+              <div class="provider-card">
+                <span>Antigravity</span>
+                <strong>Patch bundle</strong>
+              </div>
+            </div>
+            <div class="merge-line" aria-hidden="true">
+              <span></span>
+            </div>
+            <div class="policy-list" aria-label="Conflict resolution policy">
+              <div class="policy-step">
+                <span>01</span>
+                <p>Prevent high-risk overlap with narrow locks for files, modules, generated artifacts, or logical work units.</p>
+              </div>
+              <div class="policy-step">
+                <span>02</span>
+                <p>Require each provider to emit <code>intent</code>, <code>progress</code>, <code>result</code>, and <code>conflict</code> events.</p>
+              </div>
+              <div class="policy-step">
+                <span>03</span>
+                <p>Compare patch bundles by base revision, touched paths, diff summary, assumptions, confidence, and verification output.</p>
+              </div>
+              <div class="policy-step">
+                <span>04</span>
+                <p>Merge compatible edits, reject stale or unverifiable changes, and record the accepted decision.</p>
+              </div>
+            </div>
           </div>
         </div>
       </section>
